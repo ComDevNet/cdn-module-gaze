@@ -7,7 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/home/pi/cdn-module-gaze
 Environment=NODE_ENV=production
-ExecStart=bun run start
+ExecStart=/usr/local/bin/bun run start
 Restart=always
 RestartSec=10
 StartLimitInterval=60
