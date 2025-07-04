@@ -1,0 +1,74 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// Model definitions
+model Report {
+  // Database columns
+  orgName String
+  date    String
+
+  //// Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@id([orgName, date]) // Composite primary key
+}
+
+model Module {
+  // Database columns
+  id             String           @id @default(uuid())
+  name           String           @unique
+  description    String
+  indexHtmlUrl   String           @map("index_html_url")
+  logoUrl        String           @map("logo_url")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  language       String
+  enabled        Boolean          @default(true)
+  categories     Category[]
+  ModuleCategory ModuleCategory[]
+}
+
+model Category {
+  // Database columns
+  id             String           @id @default(uuid())
+  name           String           @unique
+  description    String
+  logoUrl        String           @map("logo_url")
+  enabled        Boolean          @default(true)
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  modules        Module[]
+  ModuleCategory ModuleCategory[]
+}
+
+model ModuleCategory {
+  moduleName   String   @map("module_name")  // Foreign key to Module
+  categoryName String   @map("category_name") // Foreign key to Category based on the unique name field
+  module       Module   @relation(fields: [moduleName], references: [name])
+  category     Category @relation(fields: [categoryName], references: [name])
+
+  @@id([moduleName, categoryName])
+}
+
+model TrainingVideos {
+  // Database columns
+  id          String   @id
+  title       String
+  description String
+  videoUrl    String
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  language    String
+  instructors String[]
+}
