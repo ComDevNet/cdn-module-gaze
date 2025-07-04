@@ -1,6 +1,10 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Module Gaze
 
-## Getting Started
+This is an application that allows admins at the clc or centers to monitor the modules people are viewing in real-time.
+
+It's running on the port `3002`.
+
+## Developers (Getting Started)
 
 First, run the development server:
 

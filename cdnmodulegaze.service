@@ -1,0 +1,14 @@
+[Unit]
+Description=CDN Module Gaze, a simple way to keep track of users live in the clc.
+After=syslog.target network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/cdn-module-gaze
+Environment=NODE_ENV=production
+ExecStart=bun run start
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

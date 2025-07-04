@@ -543,7 +543,7 @@ export default function CDNModuleMonitor() {
             CDN Module Gaze
           </h1>
           <p className="text-xl text-gray-600">
-            Live monitoring of CDN module usage and anomaly detection.
+            Live monitoring of module usage.
           </p>
         </div>
 
