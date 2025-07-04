@@ -1,3 +1,5 @@
+<img src="public/og.jpg" alt="Gaze open graph" align="center" />
+
 # Module Gaze
 
 This is an application that allows admins at the clc or centers to monitor the modules people are viewing in real-time.
