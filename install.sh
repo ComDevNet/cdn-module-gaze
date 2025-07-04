@@ -17,6 +17,8 @@ curl -fsSL https://bun.sh/install | bash # for macOS, Linux, and WSL
 echo "Installing dependencies..."
 bun install
 
+source ~/.bashrc
+
 bun run build
 
 # Copy the service file to the systemd directory
