@@ -34,7 +34,7 @@ function parseIngestBody(body: unknown): {
 /**
  * POST JSON: { userId, moduleId, durationSeconds, recordedAt? }
  * Optional auth: MODULEFETCH_INGEST_SECRET + header `x-modulefetch-secret` or `Authorization: Bearer …`
- * Writes `mf-*.zip` under MODULEFETCH_LOG_DIR or /var/log/modulefetch with inner file `modulefetch.json`.
+ * Writes `mf-*.zip` under MODULEFETCH_LOG_DIR or /var/log/modulegaze with inner file `modulefetch.json`.
  */
 export async function POST(request: NextRequest) {
   if (!isModuleFetchAuthorized(request)) {

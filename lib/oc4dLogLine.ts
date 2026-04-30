@@ -7,11 +7,48 @@ export type ParsedModuleAccess = {
 };
 
 /**
- * Parse oc4d-style journal lines for client IP, optional user token, and module slug.
+ * Prefer identity from proxy headers / URL params when combined logs use `-`
+ * for the Apache-style remote user field.
+ */
+function extractUsernameFromLogLine(logLine: string): string {
+  const headerPatterns = [
+    /\b(?:x-remote-user|x-auth-request-user|x-forwarded-user|x-authenticated-user)\s*[:=]\s*([^\s,;"']+)/i,
+    /\bremote-user\s*[:=]\s*([^\s,;"']+)/i,
+  ];
+  for (const re of headerPatterns) {
+    const m = re.exec(logLine);
+    if (m?.[1]) {
+      const v = m[1].replace(/^["']|["']$/g, "");
+      if (v && v !== "-") return v;
+    }
+  }
+
+  for (const m of logLine.matchAll(
+    /(?:[?&])(?:user|username|login|email|sub)=([^&\s"']+)/gi
+  )) {
+    const raw = m[1];
+    if (!raw || raw === "-") continue;
+    try {
+      const v = decodeURIComponent(raw.replace(/\+/g, " "));
+      if (v) return v;
+    } catch {
+      if (raw) return raw;
+    }
+  }
+
+  const userTok = logLine.match(
+    /info:\s*(?:::ffff:)?\d+\.\d+\.\d+\.\d+\s+(\S+)\s+\[/
+  );
+  if (userTok?.[1] && userTok[1] !== "-") return userTok[1];
+
+  return "Guest";
+}
+
+/**
+ * Parse oc4d-style journal lines for client IP, user identity, and module slug.
  *
- * Expected shape (remote user is either `-` or a login name before the ISO bracket):
- * `... info: ::ffff:192.168.1.10 - [2024-07-02T03:13:12.202Z] "GET /modules/slug/...`
- * `... info: ::ffff:192.168.1.10 alice [2024-07-02T03:13:12.202Z] "GET /modules/slug/...`
+ * Remote user after IP is either `-` (anonymous) or a login; headers / query
+ * can carry the real user when the second field is `-`.
  */
 export function parseOc4dModuleAccessLine(
   logLine: string
@@ -22,32 +59,7 @@ export function parseOc4dModuleAccessLine(
 
   const ip = ipMatch[1];
   const moduleName = moduleInfo.moduleId;
-
-  const userTok = logLine.match(
-    /info:\s*(?:::ffff:)?\d+\.\d+\.\d+\.\d+\s+(\S+)\s+\[/
-  );
-  let username = "Guest";
-  if (userTok?.[1] && userTok[1] !== "-") username = userTok[1];
+  const username = extractUsernameFromLogLine(logLine);
 
   return { ip, username, module: moduleName };
-}
-
-/** Synthetic line compatible with {@link parseOc4dModuleAccessLine}. */
-export function formatOc4dModuleAccessLogLine(params: {
-  ip: string;
-  username: string;
-  moduleSlug: string;
-  assetPath?: string;
-}): string {
-  const userField =
-    params.username.trim() && params.username !== "Guest"
-      ? params.username.trim()
-      : "-";
-  const slug = params.moduleSlug;
-  const requestLine =
-    params.assetPath ??
-    `GET /modules/${slug}/content/node/demo.html HTTP/1.1`;
-  const ts = new Date().toISOString();
-  const referer = `http://oc4d.cdn/modules/${slug}/content/index.html`;
-  return `Apr 30 12:00:00 cdn oc4d[9999]: info: ::ffff:${params.ip} ${userField} [${ts}] "${requestLine}" 200 - "${referer}" "Mozilla/5.0 (module-gaze-demo)"`;
 }

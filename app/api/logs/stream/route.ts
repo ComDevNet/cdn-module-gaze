@@ -1,33 +1,21 @@
 import type { NextRequest } from "next/server"
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process"
-import { formatOc4dModuleAccessLogLine } from "@/lib/oc4dLogLine"
 
 // Ensure this route is dynamic and not statically generated
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
-const MOCK_TICK_MS = 2500
 const IDLE_KEEPALIVE_MS = 25_000
-
-/** Only used when client explicitly requests `?mock=1` (demo / QA). */
-const MOCK_SCENARIOS = [
-  { ip: "10.0.0.12", username: "alice.nguyen", moduleSlug: "cdn_acid_bases_and_salts" },
-  { ip: "10.0.0.13", username: "bob.kim", moduleSlug: "en-schools" },
-  { ip: "10.0.0.14", username: "Guest", moduleSlug: "cdn_acid_bases_and_salts" },
-  { ip: "10.0.0.12", username: "alice.nguyen", moduleSlug: "en-schools" },
-  { ip: "192.168.50.2", username: "carlos.m", moduleSlug: "cdn_acid_bases_and_salts" },
-] as const
 
 export async function GET(request: NextRequest) {
   const encoder = new TextEncoder()
-  const useMock = request.nextUrl.searchParams.get("mock") === "1"
 
   const stream = new ReadableStream({
     start(controller) {
       let closed = false
       let backgroundTimer: ReturnType<typeof setInterval> | null = null
-      /** `mock` = demo lines only; `idle` = no fake users, keepalive only; `null` = live journal only */
-      let streamKind: null | "mock" | "idle" = null
+      /** `idle` = no journal, keepalive only; `null` = live journal */
+      let streamKind: null | "idle" = null
       let logProcess: ChildProcessWithoutNullStreams | null = null
 
       const clearBackground = () => {
@@ -58,35 +46,6 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      /** Explicit demo only — never used for “real” monitoring. */
-      const startMockDemoStream = (reason: string) => {
-        if (streamKind !== null) return
-        streamKind = "mock"
-        console.log(`📟 Mock demo log stream — ${reason}`)
-        let i = 0
-        const pushOne = () => {
-          if (closed) return
-          const row = MOCK_SCENARIOS[i % MOCK_SCENARIOS.length]
-          i += 1
-          const line = formatOc4dModuleAccessLogLine({
-            ip: row.ip,
-            username: row.username,
-            moduleSlug: row.moduleSlug,
-          })
-          const logData = JSON.stringify({
-            line,
-            timestamp: new Date().toISOString(),
-          })
-          safeEnqueue(encoder.encode(`data: ${logData}\n\n`))
-        }
-        pushOne()
-        backgroundTimer = setInterval(pushOne, MOCK_TICK_MS)
-      }
-
-      /**
-       * No fabricated users: tell the client why, then comment keepalives only.
-       * Table stays empty until real `data:` lines exist (Linux + journalctl).
-       */
       const startIdleLogStream = (reason: string) => {
         if (streamKind !== null) return
         streamKind = "idle"
@@ -112,14 +71,9 @@ export async function GET(request: NextRequest) {
       }
       request.signal.addEventListener("abort", onClientAbort)
 
-      if (useMock) {
-        startMockDemoStream("client requested ?mock=1")
-        return
-      }
-
       if (process.platform === "win32") {
         startIdleLogStream(
-          "journalctl is not available on Windows. Deploy on Linux with systemd for live oc4d logs, or enable “Demo log stream” for sample data only."
+          "journalctl is not available on Windows. Run this app on your Linux oc4d host to stream live oc4d.service logs."
         )
         return
       }
@@ -144,7 +98,7 @@ export async function GET(request: NextRequest) {
           .filter((line: string) => line.trim())
 
         logLines.forEach((line: string) => {
-          if (line.includes("/modules/")) {
+          if (line.includes("/modules/") || line.includes("/uploads/modules/")) {
             console.log("📋 Module access detected:", line.substring(0, 100) + "...")
 
             const logData = JSON.stringify({
@@ -164,12 +118,10 @@ export async function GET(request: NextRequest) {
       logProcess.on("close", (code) => {
         console.log(`Log monitoring process exited with code ${code}`)
         logProcess = null
-        // Demo stream or idle keepalive: do not end the HTTP stream here.
-        if (streamKind === "mock" || streamKind === "idle") return
-        // After ENOENT, `close` can run before the `error` handler installs the idle stream; defer.
+        if (streamKind === "idle") return
         setTimeout(() => {
           if (closed) return
-          if (streamKind === "mock" || streamKind === "idle") return
+          if (streamKind === "idle") return
           safeClose()
         }, 0)
       })
@@ -181,7 +133,7 @@ export async function GET(request: NextRequest) {
             "journalctl not found; opening idle stream (no synthetic users)."
           )
           startIdleLogStream(
-            "journalctl was not found in PATH. Install systemd tools or run on the oc4d host. Enable “Demo log stream” only if you need sample rows."
+            "journalctl was not found in PATH. Install systemd journal tools or run on the oc4d server that ships oc4d logs."
           )
           return
         }

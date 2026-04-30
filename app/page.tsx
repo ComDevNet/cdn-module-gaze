@@ -18,6 +18,10 @@ import {
 } from "lucide-react";
 import { extractModuleIdFromPath } from "@/lib/modulePath";
 import { parseOc4dModuleAccessLine } from "@/lib/oc4dLogLine";
+import {
+  postModulefetchIngest,
+  sessionToModulefetchUserId,
+} from "@/lib/postModulefetchIngest";
 
 interface UserSession {
   ip: string;
@@ -73,23 +77,34 @@ export default function CDNModuleMonitor() {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
-  /** Synthetic SSE (`?mock=1`) — sample rows only; never used for real traffic. */
-  const [useMockLogStream, setUseMockLogStream] = useState(false);
-  /** Server hint when live journalctl is unavailable (e.g. Windows); no fake users. */
+  /** Server hint when live journalctl is unavailable (e.g. Windows). */
   const [logSourceInfo, setLogSourceInfo] = useState<{ reason: string } | null>(
     null
   );
   const eventSourceRef = useRef<EventSource | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const userSessionsRef = useRef<UserSession[]>([]);
 
-  // Find matching module from database based on log module name
+  useEffect(() => {
+    userSessionsRef.current = userSessions;
+  }, [userSessions]);
+
+  // Find matching module from database based on log module name (slug or URL segment)
   const findMatchingModule = useCallback((logModuleName: string): Module | null => {
-    const match = modules.find((module) => {
+    const bySlug = modules.find((module) => {
       const moduleId = extractModuleIdFromPath(module.indexHtmlUrl);
       return moduleId === logModuleName;
     });
+    if (bySlug) return bySlug;
 
-    return match || null;
+    return (
+      modules.find(
+        (m) =>
+          m.indexHtmlUrl.includes(`/modules/${logModuleName}/`) ||
+          (m.indexHtmlUrl.includes("/uploads/modules/") &&
+            m.indexHtmlUrl.includes(`/${logModuleName}/`))
+      ) || null
+    );
   }, [modules]);
 
   // Get display name for a module (from DB if matched, otherwise use log name)
@@ -269,9 +284,22 @@ export default function CDNModuleMonitor() {
   // Remove sessions with no oc4d log activity (SSE "heartbeat") within the window
   const cleanupInactiveSessions = useCallback(() => {
     const staleBefore = new Date(Date.now() - SESSION_INACTIVITY_MS);
-    setUserSessions((prev) =>
-      prev.filter((session) => session.lastActivity > staleBefore)
-    );
+    setUserSessions((prev) => {
+      const removed = prev.filter((s) => s.lastActivity <= staleBefore);
+      const kept = prev.filter((s) => s.lastActivity > staleBefore);
+      if (removed.length > 0) {
+        queueMicrotask(() => {
+          for (const s of removed) {
+            void postModulefetchIngest({
+              userId: sessionToModulefetchUserId(s),
+              moduleId: s.module,
+              durationSeconds: s.duration,
+            });
+          }
+        });
+      }
+      return kept;
+    });
   }, []);
 
   // Update session durations
@@ -302,6 +330,15 @@ export default function CDNModuleMonitor() {
   // Start/Stop monitoring
   const toggleMonitoring = async () => {
     if (isMonitoring) {
+      const snapshot = userSessionsRef.current;
+      for (const s of snapshot) {
+        void postModulefetchIngest({
+          userId: sessionToModulefetchUserId(s),
+          moduleId: s.module,
+          durationSeconds: s.duration,
+        });
+      }
+      setUserSessions([]);
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
@@ -311,10 +348,7 @@ export default function CDNModuleMonitor() {
     } else {
       try {
         setLogSourceInfo(null);
-        const streamUrl = useMockLogStream
-          ? "/api/logs/stream?mock=1"
-          : "/api/logs/stream";
-        const eventSource = new EventSource(streamUrl);
+        const eventSource = new EventSource("/api/logs/stream");
         eventSourceRef.current = eventSource;
 
         eventSource.addEventListener("log-source", (ev: Event) => {
@@ -761,23 +795,6 @@ export default function CDNModuleMonitor() {
 
         {/* Monitoring Control */}
         <div className="flex flex-col items-center gap-4">
-          <label className="flex items-center gap-2 cursor-pointer select-none text-sm text-gray-700 max-w-lg text-center">
-            <input
-              type="checkbox"
-              checked={useMockLogStream}
-              onChange={(e) => setUseMockLogStream(e.target.checked)}
-              disabled={isMonitoring}
-              className="h-4 w-4 rounded border-gray-300 text-orange-600 focus:ring-orange-500"
-            />
-            <span>
-              <strong>Demo log stream</strong> — adds{" "}
-              <code className="text-xs bg-gray-100 px-1 rounded">?mock=1</code>{" "}
-              and sends <em>sample</em> users only for UI testing. Leave{" "}
-              <strong>unchecked</strong> on your oc4d/Linux host to show{" "}
-              <strong>real</strong> users from{" "}
-              <code className="text-xs bg-gray-100 px-1 rounded">journalctl</code>.
-            </span>
-          </label>
           {isMonitoring && logSourceInfo && (
             <Alert className="max-w-2xl border-amber-200 bg-amber-50 text-left">
               <AlertTriangle className="h-4 w-4 text-amber-700" />

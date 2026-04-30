@@ -5,7 +5,7 @@ import path from "path";
 import archiver from "archiver";
 
 /** Production default; override with MODULEFETCH_LOG_DIR. */
-export const DEFAULT_MODULEFETCH_DIR = "/var/log/modulefetch";
+export const DEFAULT_MODULEFETCH_DIR = "/var/log/modulegaze";
 
 export function getModuleFetchDir(): string {
   const fromEnv = process.env.MODULEFETCH_LOG_DIR?.trim();
