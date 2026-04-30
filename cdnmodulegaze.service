@@ -7,6 +7,10 @@ Type=simple
 User=root
 WorkingDirectory=/home/pi/cdn-module-gaze
 Environment=NODE_ENV=production
+# Append module-related oc4d lines to /var/log/modulegaze/modulegaze-access.log
+# Environment=MODULEGAZE_TEE_ACCESS_LOG=1
+# Optional zip snapshots while the UI tab is monitoring (no rebuild needed):
+# Environment=MODULEFETCH_PERIODIC_FLUSH_MINUTES=5
 ExecStart=/home/pi/.bun/bin/bun run start
 Restart=always
 RestartSec=10

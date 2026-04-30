@@ -4,7 +4,15 @@ import { prisma } from "@/lib/prisma"
 // Ensure this route is dynamic
 export const dynamic = "force-dynamic"
 
+function readPeriodicFlushMinutes(): number {
+  const raw = process.env.MODULEFETCH_PERIODIC_FLUSH_MINUTES?.trim()
+  if (!raw) return 0
+  const n = Number.parseFloat(raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
 export async function GET() {
+  const modulefetchPeriodicFlushMinutes = readPeriodicFlushMinutes()
   try {
     // Read from your actual database structure
     const [totalModules, totalCategories] = await Promise.all([
@@ -25,6 +33,7 @@ export async function GET() {
       totalCategories,
       uniqueUsersToday: 0, // Will be updated by frontend from live sessions
       activeSessions: 0, // Will be updated by frontend from live sessions
+      modulefetchPeriodicFlushMinutes,
     }
 
     return NextResponse.json(stats)
@@ -37,6 +46,7 @@ export async function GET() {
       totalCategories: 0,
       uniqueUsersToday: 0,
       activeSessions: 0,
+      modulefetchPeriodicFlushMinutes,
     })
   }
 }

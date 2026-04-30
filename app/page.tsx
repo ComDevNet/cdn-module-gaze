@@ -43,6 +43,8 @@ interface Stats {
   totalCategories: number;
   uniqueUsersToday: number;
   activeSessions: number;
+  /** From server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (zip snapshots while monitoring). */
+  modulefetchPeriodicFlushMinutes?: number;
 }
 
 interface Module {
@@ -327,6 +329,28 @@ export default function CDNModuleMonitor() {
     return () => clearInterval(interval);
   }, [checkTimerViolations]);
 
+  /**
+   * Optional: write mf-*.zip snapshots on a timer while monitoring (same ingest as
+   * Stop). Server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (exposed via /api/stats).
+   */
+  useEffect(() => {
+    if (!isMonitoring) return;
+    const mins = stats.modulefetchPeriodicFlushMinutes ?? 0;
+    if (!Number.isFinite(mins) || mins <= 0) return;
+    const ms = Math.round(mins * 60 * 1000);
+    const id = window.setInterval(() => {
+      for (const s of userSessionsRef.current) {
+        void postModulefetchIngest({
+          userId: sessionToModulefetchUserId(s),
+          moduleId: s.module,
+          durationSeconds: s.duration,
+          recordedAt: new Date().toISOString(),
+        });
+      }
+    }, ms);
+    return () => clearInterval(id);
+  }, [isMonitoring, stats.modulefetchPeriodicFlushMinutes]);
+
   // Start/Stop monitoring
   const toggleMonitoring = async () => {
     if (isMonitoring) {
@@ -440,10 +464,11 @@ export default function CDNModuleMonitor() {
     try {
       const response = await fetch("/api/modules");
       const data = await response.json();
-      setModules(data);
+      const list: Module[] = Array.isArray(data) ? data : [];
+      setModules(list);
       console.log(
         "📚 Loaded modules for matching:",
-        data.map((m: Module) => ({
+        list.map((m) => ({
           name: m.name,
           urlId: extractModuleIdFromPath(m.indexHtmlUrl),
         }))
@@ -500,12 +525,18 @@ export default function CDNModuleMonitor() {
     };
   }, []);
 
-  // Filter modules based on search term
-  const filteredModules = modules.filter(
-    (module) =>
-      module.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      module.description.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  // Filter modules based on search term (include path/slug so e.g. "en-ebooks" matches)
+  const q = searchTerm.toLowerCase().trim();
+  const filteredModules = modules.filter((module) => {
+    const slug = (extractModuleIdFromPath(module.indexHtmlUrl) ?? "").toLowerCase();
+    const url = module.indexHtmlUrl.toLowerCase();
+    return (
+      module.name.toLowerCase().includes(q) ||
+      module.description.toLowerCase().includes(q) ||
+      url.includes(q) ||
+      slug.includes(q)
+    );
+  });
 
   // Check if module has a timer set
   const hasTimer = (moduleName: string) => {

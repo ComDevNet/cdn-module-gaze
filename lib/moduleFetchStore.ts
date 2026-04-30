@@ -4,8 +4,18 @@ import { createWriteStream } from "fs";
 import path from "path";
 import archiver from "archiver";
 
+/**
+ * This directory holds:
+ * - `mf-*.zip` — written only when the browser POSTs `/api/modulefetch/ingest`
+ *   (session removed after inactivity, or when you click Stop monitoring). Not a
+ *   mirror of nginx/journald.
+ * - `modulegaze-access.log` — optional copy of module-related lines from the SSE
+ *   log stream when `MODULEGAZE_TEE_ACCESS_LOG=1`.
+ */
 /** Production default; override with MODULEFETCH_LOG_DIR. */
 export const DEFAULT_MODULEFETCH_DIR = "/var/log/modulegaze";
+
+export const MODULEGAZE_ACCESS_LOG_NAME = "modulegaze-access.log";
 
 export function getModuleFetchDir(): string {
   const fromEnv = process.env.MODULEFETCH_LOG_DIR?.trim();
@@ -27,6 +37,23 @@ const PURGE_INTERVAL_MS = 60 * 60 * 1000;
 
 export async function ensureModuleFetchDir(dir: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
+}
+
+export function isAccessLogTeeEnabled(): boolean {
+  const v = process.env.MODULEGAZE_TEE_ACCESS_LOG?.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+/** Append one line (ISO prefix + tab + single-line payload) when tee is enabled. */
+export async function appendModulegazeAccessLogLine(
+  rawLine: string
+): Promise<void> {
+  if (!isAccessLogTeeEnabled()) return;
+  const dir = getModuleFetchDir();
+  await ensureModuleFetchDir(dir);
+  const oneLine = rawLine.replace(/\r?\n/g, " ").trim();
+  const out = `${new Date().toISOString()}\t${oneLine}\n`;
+  await fs.appendFile(path.join(dir, MODULEGAZE_ACCESS_LOG_NAME), out, "utf8");
 }
 
 /** Deletes `*.zip` in `dir` whose mtime is older than one year. Returns count removed. */

@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server"
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process"
+import { appendModulegazeAccessLogLine } from "@/lib/moduleFetchStore"
 
 // Ensure this route is dynamic and not statically generated
 export const dynamic = "force-dynamic"
@@ -107,6 +108,9 @@ export async function GET(request: NextRequest) {
             })
 
             safeEnqueue(encoder.encode(`data: ${logData}\n\n`))
+            void appendModulegazeAccessLogLine(line.trim()).catch((err) =>
+              console.error("[modulegaze] access log tee failed:", err)
+            )
           }
         })
       })

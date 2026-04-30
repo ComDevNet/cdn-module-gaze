@@ -4,6 +4,10 @@
  * If MODULEFETCH_INGEST_SECRET is set on the server, this returns 401 unless
  * you add a trusted server-side caller; leave the secret unset on private LANs
  * for this UI flush to work.
+ *
+ * Live nginx/journal lines are not written here; use MODULEGAZE_TEE_ACCESS_LOG=1
+ * on the server to append module-related lines to modulegaze-access.log, or
+ * MODULEFETCH_PERIODIC_FLUSH_MINUTES (see /api/stats) for timed zip snapshots.
  */
 export async function postModulefetchIngest(payload: {
   userId: string;

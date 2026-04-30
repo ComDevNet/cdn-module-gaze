@@ -39,10 +39,6 @@ export function extractModuleIdFromPath(pathOrUrl: string): string | null {
   return preferStableModuleSegment(segments);
 }
 
-function looksLikeUserAgent(quoted: string): boolean {
-  return /^Mozilla\//i.test(quoted) || /^Opera\//i.test(quoted);
-}
-
 /** e.g. oc4d build/instance id `1763387547577_khemf99ie` vs stable slug `cdn_acid_bases_and_salts` */
 const DYNAMIC_MODULE_SEGMENT = /^\d{10,}_[a-zA-Z0-9_-]+$/;
 
@@ -86,59 +82,42 @@ function moduleSegmentsFromPathname(pathname: string): string[] {
   return out;
 }
 
-/** Collect module-related path segments from GET and quoted URLs in log order. */
-export function collectModuleSegmentsFromLogLine(logLine: string): string[] {
-  const seen = new Set<string>();
-  const ordered: string[] = [];
-
-  const addFromPathOrUrl = (raw: string) => {
-    const pathname = decodePathSafe(getPathname(raw));
-    for (const seg of moduleSegmentsFromPathname(pathname)) {
-      if (!seen.has(seg)) {
-        seen.add(seg);
-        ordered.push(seg);
-      }
-    }
-  };
-
-  const getMatch = logLine.match(/"GET\s+([^\s"]+)/);
-  if (getMatch?.[1]) addFromPathOrUrl(getMatch[1]);
-
-  for (const m of logLine.matchAll(/"([^"]*)"/g)) {
-    const quoted = m[1];
-    if (!quoted || quoted.startsWith("GET ") || looksLikeUserAgent(quoted)) {
-      continue;
-    }
-    if (
-      !quoted.includes("/modules/") &&
-      !quoted.includes("/uploads/modules/")
-    ) {
-      continue;
-    }
-    addFromPathOrUrl(quoted);
+/**
+ * Only treat true module navigations (entry `index.html`), not asset/chunk
+ * GETs while scrolling, and use the GET path only (Referer must not override).
+ */
+function isModuleEntryPathname(pathname: string): boolean {
+  const p = (pathname.split("?")[0] ?? pathname).replace(/\/+$/, "");
+  if (!p.toLowerCase().endsWith("/index.html")) return false;
+  if (p.includes("/uploads/modules/")) {
+    return /\/uploads\/modules\/[^/]+\/[^/]+\/index\.html$/i.test(p);
   }
-
-  return ordered;
+  if (p.includes("/modules/")) {
+    return /\/modules\/.+\/index\.html$/i.test(p);
+  }
+  return false;
 }
 
 /**
- * Resolve module id from a log line: gather segments from GET + quoted URLs,
- * then prefer a non-dynamic slug (e.g. `cdn_verbs` under `/uploads/modules/`).
+ * Module slug from the **GET** request only (avoids wrong module from Referer).
+ * Ignores non-entry requests (e.g. `.js` under `/uploads/modules/...`).
  */
 export function extractModuleIdFromLogLine(logLine: string): {
   moduleId: string;
-  source: "get" | "quoted" | "merged";
+  source: "get";
 } | null {
-  const segments = collectModuleSegmentsFromLogLine(logLine);
+  const getMatch = logLine.match(/"GET\s+([^\s"]+)/);
+  if (!getMatch?.[1]) return null;
+
+  const pathname = decodePathSafe(getPathname(getMatch[1]));
+  if (!pathname.includes("/modules/") && !pathname.includes("/uploads/modules/")) {
+    return null;
+  }
+  if (!isModuleEntryPathname(pathname)) return null;
+
+  const segments = moduleSegmentsFromPathname(pathname);
   const chosen = preferStableModuleSegment(segments);
   if (!chosen) return null;
 
-  const getMatch = logLine.match(/"GET\s+([^\s"]+)/);
-  const fromGet = getMatch?.[1]
-    ? extractModuleIdFromPath(getMatch[1])
-    : null;
-  const source: "get" | "quoted" | "merged" =
-    fromGet === chosen ? "get" : fromGet ? "merged" : "quoted";
-
-  return { moduleId: chosen, source };
+  return { moduleId: chosen, source: "get" };
 }
