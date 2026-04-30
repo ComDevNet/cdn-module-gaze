@@ -1,4 +1,7 @@
-import { extractModuleIdFromLogLine } from "@/lib/modulePath";
+import {
+  extractModuleAssetActivitySlugFromLogLine,
+  extractModuleIdFromLogLine,
+} from "@/lib/modulePath";
 
 export type ParsedModuleAccess = {
   ip: string;
@@ -61,5 +64,22 @@ export function parseOc4dModuleAccessLine(
   const moduleName = moduleInfo.moduleId;
   const username = extractUsernameFromLogLine(logLine);
 
+  return { ip, username, module: moduleName };
+}
+
+/**
+ * Same identity fields as `parseOc4dModuleAccessLine`, but for non-index module
+ * GETs (assets). Used only to bump session `lastActivity` when the slug matches
+ * the active session.
+ */
+export function parseOc4dModuleAssetHeartbeat(
+  logLine: string
+): ParsedModuleAccess | null {
+  const moduleName = extractModuleAssetActivitySlugFromLogLine(logLine);
+  if (!moduleName) return null;
+  const ipMatch = logLine.match(/info:\s*(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)/);
+  if (!ipMatch) return null;
+  const ip = ipMatch[1];
+  const username = extractUsernameFromLogLine(logLine);
   return { ip, username, module: moduleName };
 }

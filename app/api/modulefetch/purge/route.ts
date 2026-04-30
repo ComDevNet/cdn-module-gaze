@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { isModuleFetchAuthorized } from "@/lib/moduleFetchAuth";
 import {
   getModuleFetchDir,
-  purgeOldModuleFetchZips,
+  purgeOldModuleFetchArchives,
 } from "@/lib/moduleFetchStore";
 
 export const dynamic = "force-dynamic";
@@ -14,7 +14,7 @@ export async function POST(request: NextRequest) {
   }
   const dir = getModuleFetchDir();
   try {
-    const removed = await purgeOldModuleFetchZips(dir);
+    const removed = await purgeOldModuleFetchArchives(dir);
     return NextResponse.json({ ok: true, removed });
   } catch (e) {
     console.error("[modulefetch] purge failed:", e);

@@ -6,7 +6,7 @@ import archiver from "archiver";
 
 /**
  * This directory holds:
- * - `mf-*.zip` — written only when the browser POSTs `/api/modulefetch/ingest`
+ * - `mf-*.tar.gz` — written only when the browser POSTs `/api/modulefetch/ingest`
  *   (session removed after inactivity, or when you click Stop monitoring). Not a
  *   mirror of nginx/journald.
  * - `modulegaze-access.log` — optional copy of module-related lines from the SSE
@@ -56,8 +56,13 @@ export async function appendModulegazeAccessLogLine(
   await fs.appendFile(path.join(dir, MODULEGAZE_ACCESS_LOG_NAME), out, "utf8");
 }
 
-/** Deletes `*.zip` in `dir` whose mtime is older than one year. Returns count removed. */
-export async function purgeOldModuleFetchZips(dir: string): Promise<number> {
+function isModuleFetchArchive(name: string): boolean {
+  if (!name.startsWith("mf-")) return false;
+  return name.endsWith(".tar.gz") || name.endsWith(".zip");
+}
+
+/** Deletes `mf-*.tar.gz` (and legacy `mf-*.zip`) in `dir` older than one year. */
+export async function purgeOldModuleFetchArchives(dir: string): Promise<number> {
   const now = Date.now();
   let removed = 0;
   let entries: Dirent[];
@@ -67,7 +72,7 @@ export async function purgeOldModuleFetchZips(dir: string): Promise<number> {
     return 0;
   }
   for (const ent of entries) {
-    if (!ent.isFile() || !ent.name.endsWith(".zip")) continue;
+    if (!ent.isFile() || !isModuleFetchArchive(ent.name)) continue;
     const full = path.join(dir, ent.name);
     let st;
     try {
@@ -88,11 +93,11 @@ export async function purgeOldModuleFetchZips(dir: string): Promise<number> {
 }
 
 /** Throttled purge so routine ingests do not scan the directory every time. */
-export async function maybePurgeOldZips(dir: string): Promise<void> {
+export async function maybePurgeOldArchives(dir: string): Promise<void> {
   const t = Date.now();
   if (t - lastPurgeTime < PURGE_INTERVAL_MS) return;
   lastPurgeTime = t;
-  await purgeOldModuleFetchZips(dir);
+  await purgeOldModuleFetchArchives(dir);
 }
 
 function sanitizeFilePart(s: string, maxLen: number): string {
@@ -101,10 +106,10 @@ function sanitizeFilePart(s: string, maxLen: number): string {
 }
 
 /**
- * Writes one zip per ingest, containing a single `modulefetch.json` at the archive root
- * (stable path for downstream sync tools such as cdn-auto).
+ * Writes one `.tar.gz` per ingest: gzip-compressed tar with `modulefetch.json` at the
+ * archive root (same logical layout as the former zip; path for downstream tools).
  */
-export async function writeModuleFetchSessionZip(
+export async function writeModuleFetchSessionTarGz(
   dir: string,
   payload: Omit<ModuleFetchPayload, "schemaVersion" | "recordedAt"> & {
     recordedAt?: string;
@@ -121,12 +126,15 @@ export async function writeModuleFetchSessionZip(
   const json = JSON.stringify(fullPayload, null, 2);
   const stamp = fullPayload.recordedAt.replace(/[:.]/g, "-");
   const rand = Math.random().toString(36).slice(2, 10);
-  const filename = `mf-${sanitizeFilePart(stamp, 48)}-${rand}.zip`;
+  const filename = `mf-${sanitizeFilePart(stamp, 48)}-${rand}.tar.gz`;
   const outPath = path.join(dir, filename);
 
   await new Promise<void>((resolve, reject) => {
     const output = createWriteStream(outPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = archiver("tar", {
+      gzip: true,
+      gzipOptions: { level: 9 },
+    });
     archive.on("error", reject);
     output.on("error", reject);
     output.on("close", () => resolve());

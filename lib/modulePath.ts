@@ -99,6 +99,25 @@ function isModuleEntryPathname(pathname: string): boolean {
 }
 
 /**
+ * Stable slug from a **non-entry** GET still under module CDN paths (chunks, css,
+ * etc.). Used to refresh `lastActivity` while someone stays in a module without
+ * reloading `index.html`. Returns null for entry navigations (use
+ * `extractModuleIdFromLogLine` for those).
+ */
+export function extractModuleAssetActivitySlugFromLogLine(
+  logLine: string
+): string | null {
+  const getMatch = logLine.match(/"GET\s+([^\s"]+)/);
+  if (!getMatch?.[1]) return null;
+  const pathname = decodePathSafe(getPathname(getMatch[1]));
+  if (!pathname.includes("/modules/") && !pathname.includes("/uploads/modules/")) {
+    return null;
+  }
+  if (isModuleEntryPathname(pathname)) return null;
+  return extractModuleIdFromPath(pathname);
+}
+
+/**
  * Module slug from the **GET** request only (avoids wrong module from Referer).
  * Ignores non-entry requests (e.g. `.js` under `/uploads/modules/...`).
  */

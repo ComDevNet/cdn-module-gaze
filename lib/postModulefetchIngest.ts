@@ -1,5 +1,5 @@
 /**
- * Browser → same-origin POST /api/modulefetch/ingest (writes a zip under
+ * Browser → same-origin POST /api/modulefetch/ingest (writes a `.tar.gz` under
  * MODULEFETCH_LOG_DIR, default /var/log/modulegaze).
  * If MODULEFETCH_INGEST_SECRET is set on the server, this returns 401 unless
  * you add a trusted server-side caller; leave the secret unset on private LANs

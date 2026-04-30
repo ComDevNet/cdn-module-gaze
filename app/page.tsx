@@ -17,7 +17,10 @@ import {
   Check,
 } from "lucide-react";
 import { extractModuleIdFromPath } from "@/lib/modulePath";
-import { parseOc4dModuleAccessLine } from "@/lib/oc4dLogLine";
+import {
+  parseOc4dModuleAccessLine,
+  parseOc4dModuleAssetHeartbeat,
+} from "@/lib/oc4dLogLine";
 import {
   postModulefetchIngest,
   sessionToModulefetchUserId,
@@ -57,8 +60,12 @@ interface Module {
   categories: { name: string; description: string }[];
 }
 
-/** README: sessions drop after this long with no oc4d log line (SSE activity). */
-const SESSION_INACTIVITY_MS = 100 * 60 * 1000;
+/**
+ * Drop sessions after this long with no module-scoped GET (entry or asset) for
+ * that IP+user+module. Keep modest so closing a tab stops the timer soon; asset
+ * requests while still in the module refresh `lastActivity`.
+ */
+const SESSION_INACTIVITY_MS = 5 * 60 * 1000;
 
 export default function CDNModuleMonitor() {
   const [userSessions, setUserSessions] = useState<UserSession[]>([]);
@@ -184,7 +191,7 @@ export default function CDNModuleMonitor() {
   }, [modules, moduleTimers, findMatchingModule]);
 
   // Update user session (one row per IP + username from oc4d remote-user field)
-  const updateUserSession = (ip: string, username: string, module: string) => {
+  const updateUserSession = useCallback((ip: string, username: string, module: string) => {
     setUserSessions((prev) => {
       const existingIndex = prev.findIndex(
         (session) => session.ip === ip && session.username === username
@@ -225,7 +232,27 @@ export default function CDNModuleMonitor() {
         },
       ];
     });
-  };
+  }, []);
+
+  /** Extends session lifetime on chunk/css GETs while the user stays in the same module. */
+  const touchUserSessionActivity = useCallback(
+    (ip: string, username: string, moduleSlug: string) => {
+      setUserSessions((prev) => {
+        const idx = prev.findIndex(
+          (s) =>
+            s.ip === ip &&
+            s.username === username &&
+            s.module === moduleSlug
+        );
+        if (idx < 0) return prev;
+        const now = new Date();
+        const next = [...prev];
+        next[idx] = { ...next[idx], lastActivity: now };
+        return next;
+      });
+    },
+    []
+  );
 
   const addModuleTimer = () => {
     if (selectedModule && timerMinutes) {
@@ -330,7 +357,7 @@ export default function CDNModuleMonitor() {
   }, [checkTimerViolations]);
 
   /**
-   * Optional: write mf-*.zip snapshots on a timer while monitoring (same ingest as
+   * Optional: write mf-*.tar.gz snapshots on a timer while monitoring (same ingest as
    * Stop). Server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (exposed via /api/stats).
    */
   useEffect(() => {
@@ -351,70 +378,95 @@ export default function CDNModuleMonitor() {
     return () => clearInterval(id);
   }, [isMonitoring, stats.modulefetchPeriodicFlushMinutes]);
 
-  // Start/Stop monitoring
-  const toggleMonitoring = async () => {
-    if (isMonitoring) {
-      const snapshot = userSessionsRef.current;
-      for (const s of snapshot) {
-        void postModulefetchIngest({
-          userId: sessionToModulefetchUserId(s),
-          moduleId: s.module,
-          durationSeconds: s.duration,
-        });
-      }
-      setUserSessions([]);
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
+  const stopMonitoring = useCallback(() => {
+    const snapshot = userSessionsRef.current;
+    for (const s of snapshot) {
+      void postModulefetchIngest({
+        userId: sessionToModulefetchUserId(s),
+        moduleId: s.module,
+        durationSeconds: s.duration,
+      });
+    }
+    setUserSessions([]);
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setLogSourceInfo(null);
+    setIsMonitoring(false);
+  }, []);
+
+  const startMonitoring = useCallback(() => {
+    if (eventSourceRef.current) return;
+    try {
       setLogSourceInfo(null);
-      setIsMonitoring(false);
-    } else {
-      try {
-        setLogSourceInfo(null);
-        const eventSource = new EventSource("/api/logs/stream");
-        eventSourceRef.current = eventSource;
+      const eventSource = new EventSource("/api/logs/stream");
+      eventSourceRef.current = eventSource;
 
-        eventSource.addEventListener("log-source", (ev: Event) => {
-          try {
-            const me = ev as MessageEvent;
-            const data = JSON.parse(me.data) as {
-              available?: boolean;
-              reason?: string;
-            };
-            if (data.available === false && data.reason) {
-              setLogSourceInfo({ reason: data.reason });
-            }
-          } catch {
-            /* ignore malformed meta */
+      eventSource.addEventListener("log-source", (ev: Event) => {
+        try {
+          const me = ev as MessageEvent;
+          const data = JSON.parse(me.data) as {
+            available?: boolean;
+            reason?: string;
+          };
+          if (data.available === false && data.reason) {
+            setLogSourceInfo({ reason: data.reason });
           }
-        });
+        } catch {
+          /* ignore malformed meta */
+        }
+      });
 
-        eventSource.onmessage = (event) => {
-          const logData = JSON.parse(event.data);
-          const parsed = parseOc4dModuleAccessLine(logData.line);
+      eventSource.onmessage = (event) => {
+        const logData = JSON.parse(event.data);
+        const parsed = parseOc4dModuleAccessLine(logData.line);
 
-          if (parsed) {
-            setLogSourceInfo(null);
-            console.log(
-              `📋 Parsed: ${parsed.username} @ ${parsed.ip} → module ${parsed.module}`
-            );
-            updateUserSession(parsed.ip, parsed.username, parsed.module);
-          }
-        };
-
-        eventSource.onerror = (error) => {
-          console.error("EventSource failed:", error);
+        if (parsed) {
           setLogSourceInfo(null);
-          setIsMonitoring(false);
-        };
+          console.log(
+            `📋 Parsed: ${parsed.username} @ ${parsed.ip} → module ${parsed.module}`
+          );
+          updateUserSession(parsed.ip, parsed.username, parsed.module);
+          return;
+        }
+        const heartbeat = parseOc4dModuleAssetHeartbeat(logData.line);
+        if (heartbeat) {
+          setLogSourceInfo(null);
+          touchUserSessionActivity(
+            heartbeat.ip,
+            heartbeat.username,
+            heartbeat.module
+          );
+        }
+      };
 
-        setIsMonitoring(true);
-      } catch (error) {
-        console.error("Failed to start monitoring:", error);
-      }
+      eventSource.onerror = (error) => {
+        console.error("EventSource failed:", error);
+        eventSourceRef.current?.close();
+        eventSourceRef.current = null;
+        setLogSourceInfo(null);
+        setIsMonitoring(false);
+      };
+
+      setIsMonitoring(true);
+    } catch (error) {
+      console.error("Failed to start monitoring:", error);
+    }
+  }, [touchUserSessionActivity, updateUserSession]);
+
+  const toggleMonitoring = () => {
+    if (isMonitoring) {
+      stopMonitoring();
+    } else {
+      startMonitoring();
     }
   };
+
+  useEffect(() => {
+    startMonitoring();
+    return () => stopMonitoring();
+  }, [startMonitoring, stopMonitoring]);
 
   // Format duration for display
   const formatDuration = (seconds: number) => {
@@ -1023,8 +1075,10 @@ export default function CDNModuleMonitor() {
                 <div className="text-center py-12 text-gray-500">
                   <Database className="h-12 w-12 mx-auto mb-4 text-gray-300" />
                   <p className="text-lg">No active sessions</p>
-                  <p className="text-sm">
-                    Start monitoring to see live user activity
+                  <p className="text-sm text-gray-500">
+                    {isMonitoring
+                      ? "Waiting for oc4d log lines that match module URLs."
+                      : "The log stream is not connected — use Start monitoring above."}
                   </p>
                 </div>
               )}

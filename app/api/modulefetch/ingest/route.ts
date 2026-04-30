@@ -3,8 +3,8 @@ import { isModuleFetchAuthorized } from "@/lib/moduleFetchAuth";
 import {
   ensureModuleFetchDir,
   getModuleFetchDir,
-  maybePurgeOldZips,
-  writeModuleFetchSessionZip,
+  maybePurgeOldArchives,
+  writeModuleFetchSessionTarGz,
 } from "@/lib/moduleFetchStore";
 
 export const dynamic = "force-dynamic";
@@ -34,7 +34,7 @@ function parseIngestBody(body: unknown): {
 /**
  * POST JSON: { userId, moduleId, durationSeconds, recordedAt? }
  * Optional auth: MODULEFETCH_INGEST_SECRET + header `x-modulefetch-secret` or `Authorization: Bearer …`
- * Writes `mf-*.zip` under MODULEFETCH_LOG_DIR or /var/log/modulegaze with inner file `modulefetch.json`.
+ * Writes `mf-*.tar.gz` under MODULEFETCH_LOG_DIR or /var/log/modulegaze with inner file `modulefetch.json`.
  */
 export async function POST(request: NextRequest) {
   if (!isModuleFetchAuthorized(request)) {
@@ -62,8 +62,8 @@ export async function POST(request: NextRequest) {
   const dir = getModuleFetchDir();
   try {
     await ensureModuleFetchDir(dir);
-    const { filename } = await writeModuleFetchSessionZip(dir, parsed);
-    void maybePurgeOldZips(dir).catch((e) =>
+    const { filename } = await writeModuleFetchSessionTarGz(dir, parsed);
+    void maybePurgeOldArchives(dir).catch((e) =>
       console.error("[modulefetch] retention purge failed:", e)
     );
     return NextResponse.json({ ok: true, filename });
