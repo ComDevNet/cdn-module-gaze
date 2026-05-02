@@ -1,6 +1,5 @@
 import type { NextRequest } from "next/server"
-import { spawn, type ChildProcessWithoutNullStreams } from "child_process"
-import { appendModulegazeAccessLogLine } from "@/lib/moduleFetchStore"
+import { subscribeJournalHubForSse } from "@/lib/oc4dJournalHub"
 
 // Ensure this route is dynamic and not statically generated
 export const dynamic = "force-dynamic"
@@ -17,7 +16,7 @@ export async function GET(request: NextRequest) {
       let backgroundTimer: ReturnType<typeof setInterval> | null = null
       /** `idle` = no journal, keepalive only; `null` = live journal */
       let streamKind: null | "idle" = null
-      let logProcess: ChildProcessWithoutNullStreams | null = null
+      let unsubscribeHub: (() => void) | null = null
 
       const clearBackground = () => {
         if (backgroundTimer !== null) {
@@ -31,6 +30,10 @@ export async function GET(request: NextRequest) {
         if (closed) return
         closed = true
         clearBackground()
+        if (unsubscribeHub) {
+          unsubscribeHub()
+          unsubscribeHub = null
+        }
         try {
           controller.close()
         } catch {
@@ -63,9 +66,9 @@ export async function GET(request: NextRequest) {
 
       const onClientAbort = () => {
         console.log("🛑 Client disconnected, stopping log stream")
-        if (logProcess) {
-          logProcess.kill("SIGTERM")
-          logProcess = null
+        if (unsubscribeHub) {
+          unsubscribeHub()
+          unsubscribeHub = null
         }
         clearBackground()
         safeClose()
@@ -79,70 +82,17 @@ export async function GET(request: NextRequest) {
         return
       }
 
-      console.log("🔍 Starting to monitor oc4d.service logs (journalctl)...")
+      console.log("🔍 SSE client subscribed to shared oc4d journal hub")
 
-      logProcess = spawn("journalctl", [
-        "-u",
-        "oc4d.service",
-        "-f",
-        "--no-pager",
-        "-o",
-        "short-iso",
-        "--since",
-        "1 minute ago",
-      ])
+      unsubscribeHub = subscribeJournalHubForSse((line: string) => {
+        console.log("📋 Module access detected:", line.substring(0, 100) + "...")
 
-      logProcess.stdout.on("data", (data) => {
-        const logLines = data
-          .toString()
-          .split("\n")
-          .filter((line: string) => line.trim())
-
-        logLines.forEach((line: string) => {
-          if (line.includes("/modules/") || line.includes("/uploads/modules/")) {
-            console.log("📋 Module access detected:", line.substring(0, 100) + "...")
-
-            const logData = JSON.stringify({
-              line: line.trim(),
-              timestamp: new Date().toISOString(),
-            })
-
-            safeEnqueue(encoder.encode(`data: ${logData}\n\n`))
-            void appendModulegazeAccessLogLine(line.trim()).catch((err) =>
-              console.error("[modulegaze] access log tee failed:", err)
-            )
-          }
+        const logData = JSON.stringify({
+          line: line.trim(),
+          timestamp: new Date().toISOString(),
         })
-      })
 
-      logProcess.stderr.on("data", (data) => {
-        console.error("Log monitoring error:", data.toString())
-      })
-
-      logProcess.on("close", (code) => {
-        console.log(`Log monitoring process exited with code ${code}`)
-        logProcess = null
-        if (streamKind === "idle") return
-        setTimeout(() => {
-          if (closed) return
-          if (streamKind === "idle") return
-          safeClose()
-        }, 0)
-      })
-
-      logProcess.on("error", (error: NodeJS.ErrnoException) => {
-        logProcess = null
-        if (error.code === "ENOENT") {
-          console.warn(
-            "journalctl not found; opening idle stream (no synthetic users)."
-          )
-          startIdleLogStream(
-            "journalctl was not found in PATH. Install systemd journal tools or run on the oc4d server that ships oc4d logs."
-          )
-          return
-        }
-        console.error("Failed to start log monitoring:", error)
-        safeClose()
+        safeEnqueue(encoder.encode(`data: ${logData}\n\n`))
       })
     },
   })

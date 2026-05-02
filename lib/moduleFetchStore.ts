@@ -3,24 +3,25 @@ import type { Dirent } from "fs";
 import { createWriteStream } from "fs";
 import path from "path";
 import archiver from "archiver";
+import { getModuleFetchDir } from "@/lib/moduleFetchPaths";
 
 /**
  * This directory holds:
  * - `mf-*.tar.gz` — written only when the browser POSTs `/api/modulefetch/ingest`
  *   (session removed after inactivity, or when you click Stop monitoring). Not a
  *   mirror of nginx/journald.
- * - `modulegaze-access.log` — optional copy of module-related lines from the SSE
- *   log stream when `MODULEGAZE_TEE_ACCESS_LOG=1`.
+ * - `modulegaze-access.log` — optional tee via `lib/moduleFetchAccessLog.ts` when
+ *   `MODULEGAZE_TEE_ACCESS_LOG=1`.
  */
-/** Production default; override with MODULEFETCH_LOG_DIR. */
-export const DEFAULT_MODULEFETCH_DIR = "/var/log/modulegaze";
-
-export const MODULEGAZE_ACCESS_LOG_NAME = "modulegaze-access.log";
-
-export function getModuleFetchDir(): string {
-  const fromEnv = process.env.MODULEFETCH_LOG_DIR?.trim();
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_MODULEFETCH_DIR;
-}
+export {
+  DEFAULT_MODULEFETCH_DIR,
+  getModuleFetchDir,
+  MODULEGAZE_ACCESS_LOG_NAME,
+} from "@/lib/moduleFetchPaths";
+export {
+  appendModulegazeAccessLogLine,
+  isAccessLogTeeEnabled,
+} from "@/lib/moduleFetchAccessLog";
 
 export interface ModuleFetchPayload {
   schemaVersion: 1;
@@ -37,23 +38,6 @@ const PURGE_INTERVAL_MS = 60 * 60 * 1000;
 
 export async function ensureModuleFetchDir(dir: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
-}
-
-export function isAccessLogTeeEnabled(): boolean {
-  const v = process.env.MODULEGAZE_TEE_ACCESS_LOG?.trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes";
-}
-
-/** Append one line (ISO prefix + tab + single-line payload) when tee is enabled. */
-export async function appendModulegazeAccessLogLine(
-  rawLine: string
-): Promise<void> {
-  if (!isAccessLogTeeEnabled()) return;
-  const dir = getModuleFetchDir();
-  await ensureModuleFetchDir(dir);
-  const oneLine = rawLine.replace(/\r?\n/g, " ").trim();
-  const out = `${new Date().toISOString()}\t${oneLine}\n`;
-  await fs.appendFile(path.join(dir, MODULEGAZE_ACCESS_LOG_NAME), out, "utf8");
 }
 
 function isModuleFetchArchive(name: string): boolean {
@@ -144,4 +128,19 @@ export async function writeModuleFetchSessionTarGz(
   });
 
   return { filename };
+}
+
+/** Server-side ingest (same files as POST /api/modulefetch/ingest). */
+export async function persistModuleFetchRecord(
+  payload: Omit<ModuleFetchPayload, "schemaVersion" | "recordedAt"> & {
+    recordedAt?: string;
+  }
+): Promise<{ filename: string }> {
+  const dir = getModuleFetchDir();
+  await ensureModuleFetchDir(dir);
+  const out = await writeModuleFetchSessionTarGz(dir, payload);
+  void maybePurgeOldArchives(dir).catch((e) =>
+    console.error("[modulefetch] retention purge failed:", e)
+  );
+  return out;
 }

@@ -17,6 +17,8 @@ import {
   Check,
 } from "lucide-react";
 import { extractModuleIdFromPath } from "@/lib/modulePath";
+import { SESSION_INACTIVITY_MS } from "@/lib/sessionConstants";
+import { resolveDisplayNameFromMap } from "@/lib/userPoolKey";
 import {
   parseOc4dModuleAccessLine,
   parseOc4dModuleAssetHeartbeat,
@@ -29,6 +31,8 @@ import {
 interface UserSession {
   ip: string;
   username: string;
+  /** Cached `User.name` from server when `User.email` matches log identity. */
+  displayName?: string;
   module: string;
   startTime: Date;
   duration: number;
@@ -48,6 +52,8 @@ interface Stats {
   activeSessions: number;
   /** From server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (zip snapshots while monitoring). */
   modulefetchPeriodicFlushMinutes?: number;
+  /** Server-side journalctl + sessions (MODULEGAZE_BACKGROUND_MONITOR). */
+  backgroundModuleMonitor?: boolean;
 }
 
 interface Module {
@@ -59,13 +65,6 @@ interface Module {
   logoUrl: string;
   categories: { name: string; description: string }[];
 }
-
-/**
- * Drop sessions after this long with no module-scoped GET (entry or asset) for
- * that IP+user+module. Keep modest so closing a tab stops the timer soon; asset
- * requests while still in the module refresh `lastActivity`.
- */
-const SESSION_INACTIVITY_MS = 5 * 60 * 1000;
 
 export default function CDNModuleMonitor() {
   const [userSessions, setUserSessions] = useState<UserSession[]>([]);
@@ -83,6 +82,8 @@ export default function CDNModuleMonitor() {
   const [selectedModule, setSelectedModule] = useState("");
   const [timerMinutes, setTimerMinutes] = useState("");
   const [modules, setModules] = useState<Module[]>([]);
+  /** Normalized login_key → display_name from GET /api/user-pool */
+  const [userPoolMap, setUserPoolMap] = useState<Record<string, string>>({});
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
@@ -90,6 +91,10 @@ export default function CDNModuleMonitor() {
   const [logSourceInfo, setLogSourceInfo] = useState<{ reason: string } | null>(
     null
   );
+  /** Pause polling server sessions (background mode only). */
+  const [backgroundViewPaused, setBackgroundViewPaused] = useState(false);
+  const statsRef = useRef(stats);
+  statsRef.current = stats;
   const eventSourceRef = useRef<EventSource | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const userSessionsRef = useRef<UserSession[]>([]);
@@ -97,6 +102,17 @@ export default function CDNModuleMonitor() {
   useEffect(() => {
     userSessionsRef.current = userSessions;
   }, [userSessions]);
+
+  const labelForSessionUser = useCallback(
+    (session: UserSession) => {
+      if (session.username === "Guest") return "Guest";
+      if (session.displayName && session.displayName.length > 0) {
+        return session.displayName;
+      }
+      return resolveDisplayNameFromMap(userPoolMap, session.username);
+    },
+    [userPoolMap]
+  );
 
   // Find matching module from database based on log module name (slug or URL segment)
   const findMatchingModule = useCallback((logModuleName: string): Module | null => {
@@ -296,7 +312,7 @@ export default function CDNModuleMonitor() {
         const who =
           session.username === "Guest"
             ? `Guest (${session.ip})`
-            : `${session.username} (${session.ip})`;
+            : `${labelForSessionUser(session)} (${session.ip})`;
         const alertMessage = `⚠️ ${who} has exceeded ${timer.timeLimit} minutes on module "${displayName}"`;
         console.log(`🚨 TIMER VIOLATION: ${alertMessage}`);
 
@@ -308,7 +324,7 @@ export default function CDNModuleMonitor() {
         });
       }
     });
-  }, [userSessions, findTimerForSession, getDisplayName]);
+  }, [userSessions, findTimerForSession, getDisplayName, labelForSessionUser]);
 
   // Remove sessions with no oc4d log activity (SSE "heartbeat") within the window
   const cleanupInactiveSessions = useCallback(() => {
@@ -331,8 +347,9 @@ export default function CDNModuleMonitor() {
     });
   }, []);
 
-  // Update session durations
+  // Update session durations (browser stream only; background uses server snapshot)
   useEffect(() => {
+    if (stats.backgroundModuleMonitor) return;
     const interval = setInterval(() => {
       setUserSessions((prev) =>
         prev.map((session) => ({
@@ -348,7 +365,7 @@ export default function CDNModuleMonitor() {
     }, 1000); // Update every second
 
     return () => clearInterval(interval);
-  }, [cleanupInactiveSessions]);
+  }, [cleanupInactiveSessions, stats.backgroundModuleMonitor]);
 
   // Check timer violations periodically
   useEffect(() => {
@@ -361,7 +378,7 @@ export default function CDNModuleMonitor() {
    * Stop). Server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (exposed via /api/stats).
    */
   useEffect(() => {
-    if (!isMonitoring) return;
+    if (!isMonitoring || stats.backgroundModuleMonitor) return;
     const mins = stats.modulefetchPeriodicFlushMinutes ?? 0;
     if (!Number.isFinite(mins) || mins <= 0) return;
     const ms = Math.round(mins * 60 * 1000);
@@ -376,9 +393,24 @@ export default function CDNModuleMonitor() {
       }
     }, ms);
     return () => clearInterval(id);
-  }, [isMonitoring, stats.modulefetchPeriodicFlushMinutes]);
+  }, [isMonitoring, stats.modulefetchPeriodicFlushMinutes, stats.backgroundModuleMonitor]);
+
+  const closeEventSourceOnly = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  }, []);
 
   const stopMonitoring = useCallback(() => {
+    if (statsRef.current.backgroundModuleMonitor) {
+      setBackgroundViewPaused(true);
+      setUserSessions([]);
+      closeEventSourceOnly();
+      setLogSourceInfo(null);
+      setIsMonitoring(false);
+      return;
+    }
     const snapshot = userSessionsRef.current;
     for (const s of snapshot) {
       void postModulefetchIngest({
@@ -388,15 +420,13 @@ export default function CDNModuleMonitor() {
       });
     }
     setUserSessions([]);
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+    closeEventSourceOnly();
     setLogSourceInfo(null);
     setIsMonitoring(false);
-  }, []);
+  }, [closeEventSourceOnly]);
 
   const startMonitoring = useCallback(() => {
+    if (statsRef.current.backgroundModuleMonitor) return;
     if (eventSourceRef.current) return;
     try {
       setLogSourceInfo(null);
@@ -443,8 +473,7 @@ export default function CDNModuleMonitor() {
 
       eventSource.onerror = (error) => {
         console.error("EventSource failed:", error);
-        eventSourceRef.current?.close();
-        eventSourceRef.current = null;
+        closeEventSourceOnly();
         setLogSourceInfo(null);
         setIsMonitoring(false);
       };
@@ -453,9 +482,21 @@ export default function CDNModuleMonitor() {
     } catch (error) {
       console.error("Failed to start monitoring:", error);
     }
-  }, [touchUserSessionActivity, updateUserSession]);
+  }, [touchUserSessionActivity, updateUserSession, closeEventSourceOnly]);
 
   const toggleMonitoring = () => {
+    if (statsRef.current.backgroundModuleMonitor) {
+      setBackgroundViewPaused((paused) => {
+        if (paused) {
+          setIsMonitoring(true);
+          return false;
+        }
+        setIsMonitoring(false);
+        setUserSessions([]);
+        return true;
+      });
+      return;
+    }
     if (isMonitoring) {
       stopMonitoring();
     } else {
@@ -464,9 +505,70 @@ export default function CDNModuleMonitor() {
   };
 
   useEffect(() => {
+    if (stats.backgroundModuleMonitor) {
+      closeEventSourceOnly();
+      setIsMonitoring(true);
+      setBackgroundViewPaused(false);
+      return () => {
+        closeEventSourceOnly();
+      };
+    }
     startMonitoring();
-    return () => stopMonitoring();
-  }, [startMonitoring, stopMonitoring]);
+    return () => {
+      if (!statsRef.current.backgroundModuleMonitor) {
+        stopMonitoring();
+      } else {
+        closeEventSourceOnly();
+      }
+    };
+  }, [
+    stats.backgroundModuleMonitor,
+    startMonitoring,
+    stopMonitoring,
+    closeEventSourceOnly,
+  ]);
+
+  useEffect(() => {
+    if (!stats.backgroundModuleMonitor || backgroundViewPaused) return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetch("/api/live-sessions");
+        const data = (await res.json()) as {
+          sessions?: Array<{
+            ip: string;
+            username: string;
+            displayName?: string;
+            module: string;
+            startTime: string;
+            lastActivity: string;
+            duration: number;
+          }>;
+        };
+        if (cancelled) return;
+        const list = data.sessions ?? [];
+        setUserSessions(
+          list.map((s) => ({
+            ip: s.ip,
+            username: s.username,
+            displayName: s.displayName,
+            module: s.module,
+            startTime: new Date(s.startTime),
+            lastActivity: new Date(s.lastActivity),
+            duration: s.duration,
+          }))
+        );
+      } catch {
+        /* ignore */
+      }
+    };
+    void pull();
+    const id = window.setInterval(() => void pull(), 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [stats.backgroundModuleMonitor, backgroundViewPaused]);
 
   // Format duration for display
   const formatDuration = (seconds: number) => {
@@ -497,7 +599,7 @@ export default function CDNModuleMonitor() {
         `🔴 Session over limit: ${
           session.username === "Guest"
             ? `Guest (${session.ip})`
-            : `${session.username} @ ${session.ip}`
+            : `${labelForSessionUser(session)} @ ${session.ip}`
         } on ${session.module} (${session.duration}s > ${limitInSeconds}s)`
       );
     }
@@ -530,6 +632,16 @@ export default function CDNModuleMonitor() {
     }
   };
 
+  const fetchUserPool = async () => {
+    try {
+      const response = await fetch("/api/user-pool");
+      const data = (await response.json()) as { map?: Record<string, string> };
+      setUserPoolMap(data.map ?? {});
+    } catch (error) {
+      console.error("Failed to fetch user pool:", error);
+    }
+  };
+
   // Fetch initial stats
   useEffect(() => {
     const fetchStats = async () => {
@@ -542,9 +654,13 @@ export default function CDNModuleMonitor() {
       }
     };
 
-    fetchStats();
-    fetchModules();
-    const interval = setInterval(fetchStats, 30000);
+    const tick = async () => {
+      await fetchStats();
+      await fetchModules();
+      await fetchUserPool();
+    };
+    void tick();
+    const interval = setInterval(() => void tick(), 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -719,7 +835,7 @@ export default function CDNModuleMonitor() {
                 {stats.uniqueUsersToday}
               </div>
               <p className="text-sm text-gray-500">
-                Distinct user sessions (IP + username)
+                Distinct user sessions (IP + log identity; name from User when email matches)
               </p>
             </CardContent>
           </Card>
@@ -889,6 +1005,17 @@ export default function CDNModuleMonitor() {
               </AlertDescription>
             </Alert>
           )}
+          {stats.backgroundModuleMonitor && (
+            <Alert className="max-w-2xl border-blue-200 bg-blue-50 text-left">
+              <Database className="h-4 w-4 text-blue-700" />
+              <AlertDescription className="text-blue-900 text-sm">
+                <strong>Server-side monitor is on</strong> (
+                <code className="text-xs">MODULEGAZE_BACKGROUND_MONITOR</code>
+                ). Sessions and archives update without keeping this tab on the log
+                stream; this page refreshes data from the server every few seconds.
+              </AlertDescription>
+            </Alert>
+          )}
           <Button
             onClick={toggleMonitoring}
             size="lg"
@@ -898,7 +1025,19 @@ export default function CDNModuleMonitor() {
                 : "bg-orange-600 hover:bg-orange-700"
             } text-white px-8 py-3 text-lg`}
           >
-            {isMonitoring ? (
+            {stats.backgroundModuleMonitor ? (
+              isMonitoring ? (
+                <>
+                  <Pause className="h-5 w-5 mr-2" />
+                  Pause live view
+                </>
+              ) : (
+                <>
+                  <Play className="h-5 w-5 mr-2" />
+                  Resume live view
+                </>
+              )
+            ) : isMonitoring ? (
               <>
                 <Pause className="h-5 w-5 mr-2" />
                 Stop Monitoring
@@ -990,7 +1129,7 @@ export default function CDNModuleMonitor() {
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
                     <th className="text-left p-4 font-semibold text-gray-700">
-                      Username
+                      Name
                     </th>
                     <th className="text-left p-4 font-semibold text-gray-700">
                       IP address
@@ -1021,7 +1160,7 @@ export default function CDNModuleMonitor() {
                           </div>
                         ) : (
                           <span className="font-medium text-gray-900">
-                            {session.username}
+                            {labelForSessionUser(session)}
                           </span>
                         )}
                       </td>

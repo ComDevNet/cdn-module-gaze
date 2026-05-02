@@ -3,8 +3,7 @@ import { isModuleFetchAuthorized } from "@/lib/moduleFetchAuth";
 import {
   ensureModuleFetchDir,
   getModuleFetchDir,
-  maybePurgeOldArchives,
-  writeModuleFetchSessionTarGz,
+  persistModuleFetchRecord,
 } from "@/lib/moduleFetchStore";
 
 export const dynamic = "force-dynamic";
@@ -62,10 +61,7 @@ export async function POST(request: NextRequest) {
   const dir = getModuleFetchDir();
   try {
     await ensureModuleFetchDir(dir);
-    const { filename } = await writeModuleFetchSessionTarGz(dir, parsed);
-    void maybePurgeOldArchives(dir).catch((e) =>
-      console.error("[modulefetch] retention purge failed:", e)
-    );
+    const { filename } = await persistModuleFetchRecord(parsed);
     return NextResponse.json({ ok: true, filename });
   } catch (e) {
     console.error("[modulefetch] ingest failed:", e);

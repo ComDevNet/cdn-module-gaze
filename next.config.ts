@@ -1,5 +1,6 @@
-/** @type {import('next').NextConfig} */
-const nextConfig = {
+import type { NextConfig } from 'next'
+
+const nextConfig: NextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
   },
@@ -9,10 +10,9 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  // Force include all styling packages
   transpilePackages: [
     '@radix-ui/react-slot',
-    '@radix-ui/react-alert-dialog', 
+    '@radix-ui/react-alert-dialog',
     '@radix-ui/react-avatar',
     '@radix-ui/react-dialog',
     '@radix-ui/react-dropdown-menu',
@@ -20,21 +20,24 @@ const nextConfig = {
     'class-variance-authority',
     'lucide-react',
     'clsx',
-    'tailwind-merge'
+    'tailwind-merge',
   ],
-  // Updated: moved from experimental.serverComponentsExternalPackages
   serverExternalPackages: [],
-  // Ensure CSS is properly processed
   experimental: {
     optimizeCss: true,
   },
-  // Make sure all imports are resolved
   webpack: (config) => {
+    config.resolve = config.resolve ?? {}
     config.resolve.alias = {
-      ...config.resolve.alias,
+      ...(config.resolve.alias as Record<string, string> | undefined),
       '@': '.',
     }
     return config
+  },
+  async redirects() {
+    return [
+      { source: '/home', destination: '/', permanent: false },
+    ]
   },
 }
 

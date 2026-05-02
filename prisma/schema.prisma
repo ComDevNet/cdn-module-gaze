@@ -72,3 +72,14 @@ model TrainingVideos {
   language    String
   instructors String[]
 }
+
+/// Application users (Prisma Studio: id, name, email).
+/// Log identity is matched to `email` (case-insensitive); UI shows `name` only.
+/// If your PostgreSQL table is not named `User`, set @@map accordingly (e.g. `users`).
+model User {
+  id    String @id
+  name  String
+  email String @unique
+
+  @@map("User")
+}

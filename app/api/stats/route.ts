@@ -11,8 +11,14 @@ function readPeriodicFlushMinutes(): number {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
+function readBackgroundModuleMonitor(): boolean {
+  const v = process.env.MODULEGAZE_BACKGROUND_MONITOR?.trim().toLowerCase()
+  return v === "1" || v === "true" || v === "yes"
+}
+
 export async function GET() {
   const modulefetchPeriodicFlushMinutes = readPeriodicFlushMinutes()
+  const backgroundModuleMonitor = readBackgroundModuleMonitor()
   try {
     // Read from your actual database structure
     const [totalModules, totalCategories] = await Promise.all([
@@ -34,6 +40,7 @@ export async function GET() {
       uniqueUsersToday: 0, // Will be updated by frontend from live sessions
       activeSessions: 0, // Will be updated by frontend from live sessions
       modulefetchPeriodicFlushMinutes,
+      backgroundModuleMonitor,
     }
 
     return NextResponse.json(stats)
@@ -47,6 +54,7 @@ export async function GET() {
       uniqueUsersToday: 0,
       activeSessions: 0,
       modulefetchPeriodicFlushMinutes,
+      backgroundModuleMonitor,
     })
   }
 }

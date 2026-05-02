@@ -7,6 +7,8 @@ Type=simple
 User=root
 WorkingDirectory=/home/pi/cdn-module-gaze
 Environment=NODE_ENV=production
+# Track sessions + mf-*.tar.gz from journalctl as soon as Next starts (no browser required)
+# Environment=MODULEGAZE_BACKGROUND_MONITOR=1
 # Append module-related oc4d lines to /var/log/modulegaze/modulegaze-access.log
 # Environment=MODULEGAZE_TEE_ACCESS_LOG=1
 # Optional zip snapshots while the UI tab is monitoring (no rebuild needed):
