@@ -76,7 +76,12 @@ function touchSession(ip: string, username: string, moduleSlug: string): void {
       r.username === username &&
       r.module === moduleSlug
   );
-  if (idx < 0) return;
+  if (idx < 0) {
+    // Background monitor can start after users already opened modules.
+    // Allow asset heartbeats to seed active sessions.
+    updateOrInsertSession(ip, username, moduleSlug);
+    return;
+  }
   const r = rows[idx];
   if (!r) return;
   rows[idx] = { ...r, lastActivityMs: now };

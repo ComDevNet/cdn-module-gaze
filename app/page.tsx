@@ -327,8 +327,23 @@ export default function CDNModuleMonitor() {
             s.username === username &&
             s.module === moduleSlug
         );
-        if (idx < 0) return prev;
         const now = new Date();
+        if (idx < 0) {
+          // If monitoring starts after user already entered a module, an asset
+          // heartbeat may be the first signal we see. Create a session so the
+          // table is not empty until next index.html navigation.
+          return [
+            ...prev,
+            {
+              ip,
+              username,
+              module: moduleSlug,
+              startTime: now,
+              duration: 0,
+              lastActivity: now,
+            },
+          ];
+        }
         const next = [...prev];
         next[idx] = { ...next[idx], lastActivity: now };
         return next;

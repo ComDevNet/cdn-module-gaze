@@ -26,6 +26,7 @@ const USERNAME_KEYS = [
 function normalizeIdentityValue(raw: string | null | undefined): string {
   if (!raw) return "";
   let out = raw.trim();
+  out = out.replace(/^(?:user|username|login|email|sub)=/i, "");
   out = out.replace(/^["']|["']$/g, "");
   out = out.replace(/[;,]+$/g, "");
   if (!out || out === "-") return "";
