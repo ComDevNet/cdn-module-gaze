@@ -18,7 +18,7 @@ Environment=MODULEFETCH_PERIODIC_FLUSH_MINUTES=5
 # Directory for modulegaze-access.log and modulegaze-sessions.log
 Environment=MODULEFETCH_LOG_DIR=/var/log/modulegaze
 # Scan modules on disk in addition to DB rows
-Environment=MODULEGAZE_UPLOADS_MODULES_ROOT=/oc4d-server/workspaces/website/uploads/modules
+Environment=MODULEGAZE_UPLOADS_MODULES_ROOT=/home/pi/oc4d-server/workspaces/website/uploads/modules
 ExecStart=/home/pi/.bun/bin/bun run start
 Restart=always
 RestartSec=10

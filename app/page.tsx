@@ -64,7 +64,7 @@ interface Module {
   language: string;
   indexHtmlUrl: string;
   logoUrl: string;
-  categories: { name: string; description: string }[];
+  categories: { name: string }[];
 }
 
 interface ModulesApiPayload {
