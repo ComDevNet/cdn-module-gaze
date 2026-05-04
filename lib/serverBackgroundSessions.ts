@@ -193,6 +193,46 @@ export function processBackgroundJournalLine(line: string): void {
   }
 }
 
+/**
+ * Public entry point for the browser-emitted heartbeat path
+ * (`POST /api/module-heartbeat?event=ping`). Same semantics as the
+ * journal-driven asset heartbeat — bumps `lastActivityMs` for an
+ * exact-match session, ignores stale heartbeats for users already
+ * tracked on a different module (thumbnail-thrash / cross-tab case),
+ * and seeds a session at cold-start if no other session exists for
+ * that browser/IP. Logged-in heartbeats also retire any Guest row at
+ * the same IP via `updateOrInsertSession`'s sign-in promotion.
+ */
+export function recordModuleHeartbeat(
+  ip: string,
+  username: string,
+  module: string
+): void {
+  touchSession(ip, username, module);
+}
+
+/**
+ * Public entry point for explicit "user closed the tab / navigated
+ * away" signals — the `pagehide` / `beforeunload` sendBeacon dispatched
+ * by the heartbeat script injected into oc4d-served module pages.
+ * Persists the session with the actual close timestamp (no 5-minute
+ * idle-timeout overcount, no lastActivityMs undercount on static pages).
+ */
+export function endModuleSession(
+  ip: string,
+  username: string,
+  module: string
+): void {
+  const idx = state.rows.findIndex(
+    (r) =>
+      r.ip === ip && r.username === username && r.module === module
+  );
+  if (idx < 0) return;
+  const row = state.rows[idx];
+  if (row) persistEndedSessionRow(row, Date.now());
+  state.rows.splice(idx, 1);
+}
+
 export function runBackgroundSessionCleanup(): void {
   const staleBefore = Date.now() - SESSION_INACTIVITY_MS;
   const removed: Row[] = [];

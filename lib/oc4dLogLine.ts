@@ -23,7 +23,7 @@ const USERNAME_KEYS = [
   "nameid",
 ];
 
-function normalizeIdentityValue(raw: string | null | undefined): string {
+export function normalizeIdentityValue(raw: string | null | undefined): string {
   if (!raw) return "";
   let out = raw.trim();
   out = out.replace(/^["']|["']$/g, "");

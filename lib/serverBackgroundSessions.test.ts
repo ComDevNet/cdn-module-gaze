@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   processBackgroundJournalLine,
   getLiveSessionsSnapshot,
+  recordModuleHeartbeat,
+  endModuleSession,
 } from "@/lib/serverBackgroundSessions";
 
 /**
@@ -210,6 +212,53 @@ test("cold-start heartbeat for a logged-in user also retires a Guest at the same
   const snap = getLiveSessionsSnapshot();
   assert.equal(snap.length, 1);
   assert.equal(snap[0]?.username, "anna@example.com");
+});
+
+test("recordModuleHeartbeat (browser ping) bumps lastActivity for the matching session", async () => {
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.20", "anna@example.com", "cdn_math")
+  );
+  const before = getLiveSessionsSnapshot()[0]!;
+  await new Promise((r) => setTimeout(r, 20));
+  recordModuleHeartbeat("192.168.1.20", "anna@example.com", "cdn_math");
+  const after = getLiveSessionsSnapshot()[0]!;
+  assert.equal(after.module, "cdn_math");
+  assert.ok(
+    new Date(after.lastActivity).getTime() >
+      new Date(before.lastActivity).getTime(),
+    "heartbeat must advance lastActivity"
+  );
+});
+
+test("recordModuleHeartbeat at cold start seeds a session (browser was already on the module before the monitor came up)", () => {
+  clearBackgroundSessions();
+  recordModuleHeartbeat("192.168.1.20", "anna@example.com", "cdn_math");
+  const snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 1);
+  assert.equal(snap[0]?.username, "anna@example.com");
+  assert.equal(snap[0]?.module, "cdn_math");
+});
+
+test("endModuleSession (browser sendBeacon on close) removes the session and records its duration", async () => {
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.20", "anna@example.com", "cdn_math")
+  );
+  // Simulate a real reading session: sleep so duration advances past the
+  // 0-second floor that `persistEndedSessionRow` filters out.
+  await new Promise((r) => setTimeout(r, 1100));
+  recordModuleHeartbeat("192.168.1.20", "anna@example.com", "cdn_math");
+  endModuleSession("192.168.1.20", "anna@example.com", "cdn_math");
+  const snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 0, "close signal must remove the session");
+});
+
+test("endModuleSession is a no-op when there is no matching session", () => {
+  clearBackgroundSessions();
+  endModuleSession("192.168.1.20", "anna@example.com", "cdn_math");
+  // Nothing throws, no rows appear out of nowhere.
+  assert.equal(getLiveSessionsSnapshot().length, 0);
 });
 
 test("two users on different modules each keep their own session against thumbnail fanout", () => {
