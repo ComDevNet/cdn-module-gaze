@@ -13,18 +13,41 @@ type Row = {
   lastActivityMs: number;
 };
 
-let rows: Row[] = [];
+/**
+ * Shared in-memory state.
+ *
+ * Next.js bundles `instrumentation.ts` (where the journal hub feeds lines
+ * into `processBackgroundJournalLine`) and the route handlers (where
+ * `getLiveSessionsSnapshot` is read by `GET /api/live-sessions`) into
+ * separate chunks. With module-scoped `let rows`, each bundle gets its own
+ * copy and the API never sees what the monitor wrote — the dashboard's
+ * "User & module time tracking" panel stayed empty no matter what oc4d
+ * logged. Pinning the array to `globalThis` makes both bundles share the
+ * same instance (same trick used by `lib/prisma.ts`).
+ */
+const SESSIONS_STATE_KEY = Symbol.for("cdnModuleGaze.backgroundSessions.state");
+type SessionsState = { rows: Row[] };
+const globalForSessions = globalThis as unknown as {
+  [SESSIONS_STATE_KEY]?: SessionsState;
+};
+const state: SessionsState =
+  globalForSessions[SESSIONS_STATE_KEY] ?? { rows: [] };
+globalForSessions[SESSIONS_STATE_KEY] = state;
 
 function userIdFor(row: Row): string {
   return `${row.username}|${row.ip}`;
 }
 
 function persistEndedSessionRow(row: Row, endedAtMs: number): void {
-  const durationSeconds = Math.max(0, Math.floor((endedAtMs - row.startTimeMs) / 1000));
-  void import(
-    /* webpackIgnore: true */
-    "./moduleFetchStore"
-  )
+  const durationSeconds = Math.max(
+    0,
+    Math.floor((endedAtMs - row.startTimeMs) / 1000)
+  );
+  // Plain dynamic import (no `webpackIgnore`): let webpack create a real
+  // chunk so the runtime path resolves under `.next/server/chunks/...`.
+  // With `webpackIgnore: true` the literal "./moduleFetchStore" string
+  // survives into the compiled chunk and bun fails to resolve it.
+  void import("./moduleFetchStore")
     .then(({ persistModuleFetchRecord }) =>
       persistModuleFetchRecord({
         userId: userIdFor(row),
@@ -38,16 +61,22 @@ function persistEndedSessionRow(row: Row, endedAtMs: number): void {
     );
 }
 
-function updateOrInsertSession(ip: string, username: string, module: string): void {
+function updateOrInsertSession(
+  ip: string,
+  username: string,
+  module: string
+): void {
   const now = Date.now();
-  const idx = rows.findIndex((r) => r.ip === ip && r.username === username);
+  const idx = state.rows.findIndex(
+    (r) => r.ip === ip && r.username === username
+  );
   if (idx >= 0) {
-    const existing = rows[idx];
+    const existing = state.rows[idx];
     if (!existing) return;
     if (existing.module !== module) {
       // Keep per-user module history when they navigate between modules.
       persistEndedSessionRow(existing, now);
-      rows[idx] = {
+      state.rows[idx] = {
         ip,
         username,
         module,
@@ -55,11 +84,11 @@ function updateOrInsertSession(ip: string, username: string, module: string): vo
         lastActivityMs: now,
       };
     } else {
-      rows[idx] = { ...existing, lastActivityMs: now };
+      state.rows[idx] = { ...existing, lastActivityMs: now };
     }
     return;
   }
-  rows.push({
+  state.rows.push({
     ip,
     username,
     module,
@@ -68,13 +97,15 @@ function updateOrInsertSession(ip: string, username: string, module: string): vo
   });
 }
 
-function touchSession(ip: string, username: string, moduleSlug: string): void {
+function touchSession(
+  ip: string,
+  username: string,
+  moduleSlug: string
+): void {
   const now = Date.now();
-  const idx = rows.findIndex(
+  const idx = state.rows.findIndex(
     (r) =>
-      r.ip === ip &&
-      r.username === username &&
-      r.module === moduleSlug
+      r.ip === ip && r.username === username && r.module === moduleSlug
   );
   if (idx < 0) {
     // Background monitor can start after users already opened modules.
@@ -82,9 +113,9 @@ function touchSession(ip: string, username: string, moduleSlug: string): void {
     updateOrInsertSession(ip, username, moduleSlug);
     return;
   }
-  const r = rows[idx];
+  const r = state.rows[idx];
   if (!r) return;
-  rows[idx] = { ...r, lastActivityMs: now };
+  state.rows[idx] = { ...r, lastActivityMs: now };
 }
 
 export function processBackgroundJournalLine(line: string): void {
@@ -103,14 +134,17 @@ export function runBackgroundSessionCleanup(): void {
   const staleBefore = Date.now() - SESSION_INACTIVITY_MS;
   const removed: Row[] = [];
   const kept: Row[] = [];
-  for (const r of rows) {
+  for (const r of state.rows) {
     if (r.lastActivityMs <= staleBefore) {
       removed.push(r);
     } else {
       kept.push(r);
     }
   }
-  rows = kept;
+  // Mutate the shared array in place so any module instance that captured
+  // a reference to `state.rows` keeps observing the latest contents.
+  state.rows.length = 0;
+  for (const r of kept) state.rows.push(r);
   for (const r of removed) {
     persistEndedSessionRow(r, Date.now());
   }
@@ -129,7 +163,7 @@ export type LiveSessionSnapshot = {
 
 export function getLiveSessionsSnapshot(): LiveSessionSnapshot[] {
   const now = Date.now();
-  return rows.map((r) => ({
+  return state.rows.map((r) => ({
     ip: r.ip,
     username: r.username,
     displayName: resolveDisplayNameFromCache(r.username),

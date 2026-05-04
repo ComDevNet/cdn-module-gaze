@@ -1,8 +1,27 @@
 import { prisma } from "@/lib/prisma";
 import { normalizeUserPoolLookupKey } from "@/lib/userPoolKey";
 
-let cache = new Map<string, string>();
-let lastLoadMs = 0;
+/**
+ * Shared cache state — same `globalThis` pinning as `serverBackgroundSessions`
+ * so the periodic refresh kicked off by `instrumentation.ts` populates the
+ * same cache the route handlers read (e.g. `getLiveSessionsSnapshot` ->
+ * `resolveDisplayNameFromCache`).
+ */
+type UserPoolCacheState = {
+  cache: Map<string, string>;
+  lastLoadMs: number;
+};
+const USER_POOL_STATE_KEY = Symbol.for("cdnModuleGaze.userPoolCache.state");
+const globalForUserPool = globalThis as unknown as {
+  [USER_POOL_STATE_KEY]?: UserPoolCacheState;
+};
+const userPoolState: UserPoolCacheState =
+  globalForUserPool[USER_POOL_STATE_KEY] ?? {
+    cache: new Map<string, string>(),
+    lastLoadMs: 0,
+  };
+globalForUserPool[USER_POOL_STATE_KEY] = userPoolState;
+
 const TTL_MS = 60_000;
 
 type UserPoolRow = {
@@ -80,7 +99,9 @@ async function loadUserPoolRows(): Promise<UserPoolRow[]> {
 
 export async function refreshUserPoolCache(force = false): Promise<void> {
   const now = Date.now();
-  if (!force && lastLoadMs > 0 && now - lastLoadMs < TTL_MS) return;
+  if (!force && userPoolState.lastLoadMs > 0 && now - userPoolState.lastLoadMs < TTL_MS) {
+    return;
+  }
   try {
     const rows = await loadUserPoolRows();
     const next = new Map<string, string>();
@@ -90,8 +111,8 @@ export async function refreshUserPoolCache(force = false): Promise<void> {
       if (!email || !displayName) continue;
       next.set(normalizeUserPoolLookupKey(email), displayName);
     }
-    cache = next;
-    lastLoadMs = now;
+    userPoolState.cache = next;
+    userPoolState.lastLoadMs = now;
   } catch (e) {
     console.error("[userPool] refresh failed:", e);
   }
@@ -99,10 +120,10 @@ export async function refreshUserPoolCache(force = false): Promise<void> {
 
 export function resolveDisplayNameFromCache(rawLogin: string): string {
   if (rawLogin === "Guest") return "Guest";
-  const hit = cache.get(normalizeUserPoolLookupKey(rawLogin));
+  const hit = userPoolState.cache.get(normalizeUserPoolLookupKey(rawLogin));
   return hit && hit.length > 0 ? hit : rawLogin;
 }
 
 export function getUserPoolMapSnapshot(): Record<string, string> {
-  return Object.fromEntries(cache.entries());
+  return Object.fromEntries(userPoolState.cache.entries());
 }
