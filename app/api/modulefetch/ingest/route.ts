@@ -33,7 +33,8 @@ function parseIngestBody(body: unknown): {
 /**
  * POST JSON: { userId, moduleId, durationSeconds, recordedAt? }
  * Optional auth: MODULEFETCH_INGEST_SECRET + header `x-modulefetch-secret` or `Authorization: Bearer …`
- * Writes `mf-*.tar.gz` under MODULEFETCH_LOG_DIR or /var/log/modulegaze with inner file `modulefetch.json`.
+ * Appends plain log entries to `modulegaze-sessions.log` under MODULEFETCH_LOG_DIR
+ * (default /var/log/modulegaze), with prior daily logs zipped automatically.
  */
 export async function POST(request: NextRequest) {
   if (!isModuleFetchAuthorized(request)) {
@@ -66,7 +67,7 @@ export async function POST(request: NextRequest) {
   } catch (e) {
     console.error("[modulefetch] ingest failed:", e);
     return NextResponse.json(
-      { error: "Failed to write archive", detail: String(e) },
+      { error: "Failed to write session log", detail: String(e) },
       { status: 500 }
     );
   }

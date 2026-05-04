@@ -11,6 +11,16 @@ let journalSpawnInFlight = false;
 /** When true, keep `journalctl` running even if no SSE clients are connected. */
 let backgroundPinned = false;
 
+function resolveJournalSinceArg(): string | null {
+  const raw = process.env.MODULEGAZE_JOURNAL_SINCE?.trim();
+  if (!raw) return "today";
+  const lowered = raw.toLowerCase();
+  if (lowered === "all" || lowered === "none" || lowered === "disable") {
+    return null;
+  }
+  return raw;
+}
+
 function isModuleLine(line: string): boolean {
   return (
     line.includes("/modules/") || line.includes("/uploads/modules/")
@@ -109,18 +119,18 @@ function startHubProcessIfNeeded(): void {
         return;
       }
 
-      console.log("🔍 oc4dJournalHub: starting journalctl -u oc4d.service -f …");
+      const sinceArg = resolveJournalSinceArg();
+      const args = ["-u", "oc4d.service", "-f", "--no-pager", "-o", "short-iso"];
+      if (sinceArg) {
+        args.push("--since", sinceArg);
+      }
+      console.log(
+        `🔍 oc4dJournalHub: starting journalctl -u oc4d.service -f ${
+          sinceArg ? `--since "${sinceArg}"` : "(full history mode)"
+        } …`
+      );
 
-      const proc = spawn("journalctl", [
-        "-u",
-        "oc4d.service",
-        "-f",
-        "--no-pager",
-        "-o",
-        "short-iso",
-        "--since",
-        "1 minute ago",
-      ]) as HubChild;
+      const proc = spawn("journalctl", args) as HubChild;
 
       logProcess = proc;
       wireJournalctlProcess(proc);

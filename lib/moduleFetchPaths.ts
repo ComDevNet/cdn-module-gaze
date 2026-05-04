@@ -2,6 +2,7 @@
 export const DEFAULT_MODULEFETCH_DIR = "/var/log/modulegaze";
 
 export const MODULEGAZE_ACCESS_LOG_NAME = "modulegaze-access.log";
+export const MODULEGAZE_SESSION_LOG_NAME = "modulegaze-sessions.log";
 
 export function getModuleFetchDir(): string {
   const fromEnv = process.env.MODULEFETCH_LOG_DIR?.trim();

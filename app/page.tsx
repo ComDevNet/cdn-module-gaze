@@ -50,7 +50,7 @@ interface Stats {
   totalCategories: number;
   uniqueUsersToday: number;
   activeSessions: number;
-  /** From server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (zip snapshots while monitoring). */
+  /** From server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (periodic session-log flush while monitoring). */
   modulefetchPeriodicFlushMinutes?: number;
   /** Server-side journalctl + sessions (MODULEGAZE_BACKGROUND_MONITOR). */
   backgroundModuleMonitor?: boolean;
@@ -64,6 +64,24 @@ interface Module {
   indexHtmlUrl: string;
   logoUrl: string;
   categories: { name: string; description: string }[];
+}
+
+interface ModulesApiPayload {
+  modules?: Module[];
+  sources?: {
+    mergedCount?: number;
+    database?: {
+      ok?: boolean;
+      count?: number;
+      error?: string | null;
+    };
+    scan?: {
+      enabled?: boolean;
+      root?: string | null;
+      count?: number;
+    };
+  };
+  warnings?: string[];
 }
 
 export default function CDNModuleMonitor() {
@@ -86,6 +104,8 @@ export default function CDNModuleMonitor() {
   const [userPoolMap, setUserPoolMap] = useState<Record<string, string>>({});
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [modulesLoadError, setModulesLoadError] = useState<string | null>(null);
+  const [modulesLoadInfo, setModulesLoadInfo] = useState<string | null>(null);
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
   /** Server hint when live journalctl is unavailable (e.g. Windows). */
   const [logSourceInfo, setLogSourceInfo] = useState<{ reason: string } | null>(
@@ -374,7 +394,7 @@ export default function CDNModuleMonitor() {
   }, [checkTimerViolations]);
 
   /**
-   * Optional: write mf-*.tar.gz snapshots on a timer while monitoring (same ingest as
+   * Optional: write session-log lines on a timer while monitoring (same ingest as
    * Stop). Server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (exposed via /api/stats).
    */
   useEffect(() => {
@@ -617,9 +637,42 @@ export default function CDNModuleMonitor() {
   const fetchModules = async () => {
     try {
       const response = await fetch("/api/modules");
-      const data = await response.json();
-      const list: Module[] = Array.isArray(data) ? data : [];
+      let data: unknown = null;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Modules API returned a non-JSON response.");
+      }
+      if (!response.ok) {
+        throw new Error(`Modules API returned ${response.status}.`);
+      }
+
+      let list: Module[] = [];
+      let infoParts: string[] = [];
+
+      if (Array.isArray(data)) {
+        list = data as Module[];
+      } else if (data && typeof data === "object") {
+        const payload = data as ModulesApiPayload;
+        list = Array.isArray(payload.modules) ? payload.modules : [];
+        if (payload.sources) {
+          const merged = payload.sources.mergedCount ?? list.length;
+          const dbCount = payload.sources.database?.count ?? 0;
+          const scanCount = payload.sources.scan?.count ?? 0;
+          infoParts.push(
+            `Loaded ${merged} modules (DB: ${dbCount}, scan: ${scanCount}).`
+          );
+        }
+        if (Array.isArray(payload.warnings) && payload.warnings.length > 0) {
+          infoParts = [...infoParts, ...payload.warnings];
+        }
+      } else {
+        throw new Error("Modules API returned an unexpected payload.");
+      }
+
       setModules(list);
+      setModulesLoadError(null);
+      setModulesLoadInfo(infoParts.length > 0 ? infoParts.join(" ") : null);
       console.log(
         "📚 Loaded modules for matching:",
         list.map((m) => ({
@@ -629,6 +682,12 @@ export default function CDNModuleMonitor() {
       );
     } catch (error) {
       console.error("Failed to fetch modules:", error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to load modules from server.";
+      setModulesLoadError(message);
+      setModulesLoadInfo(null);
     }
   };
 
@@ -900,7 +959,11 @@ export default function CDNModuleMonitor() {
 
                     {isDropdownOpen && (
                       <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-md shadow-lg max-h-60 overflow-auto">
-                        {filteredModules.length > 0 ? (
+                        {modulesLoadError ? (
+                          <div className="px-3 py-2 text-sm text-red-600">
+                            {modulesLoadError}
+                          </div>
+                        ) : filteredModules.length > 0 ? (
                           filteredModules.map((module) => {
                             const hasExistingTimer = hasTimer(module.name);
                             const existingTimer = getExistingTimer(module.name);
@@ -962,12 +1025,19 @@ export default function CDNModuleMonitor() {
                           })
                         ) : (
                           <div className="px-3 py-2 text-sm text-gray-500">
-                            No modules found
+                            {modules.length === 0
+                              ? "No modules are available from the server yet."
+                              : "No modules match your search."}
                           </div>
                         )}
                       </div>
                     )}
                   </div>
+                  {modulesLoadError ? (
+                    <p className="text-xs text-red-600">{modulesLoadError}</p>
+                  ) : modulesLoadInfo ? (
+                    <p className="text-xs text-gray-500">{modulesLoadInfo}</p>
+                  ) : null}
 
                   <div className="flex gap-2">
                     <Input

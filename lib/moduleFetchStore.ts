@@ -1,22 +1,23 @@
 import fs from "fs/promises";
 import type { Dirent } from "fs";
-import { createWriteStream } from "fs";
 import path from "path";
-import archiver from "archiver";
-import { getModuleFetchDir } from "@/lib/moduleFetchPaths";
+import {
+  getModuleFetchDir,
+  MODULEGAZE_SESSION_LOG_NAME,
+} from "@/lib/moduleFetchPaths";
+import { appendLineWithDailyZip } from "@/lib/dailyLogArchive";
 
 /**
  * This directory holds:
- * - `mf-*.tar.gz` — written only when the browser POSTs `/api/modulefetch/ingest`
- *   (session removed after inactivity, or when you click Stop monitoring). Not a
- *   mirror of nginx/journald.
- * - `modulegaze-access.log` — optional tee via `lib/moduleFetchAccessLog.ts` when
- *   `MODULEGAZE_TEE_ACCESS_LOG=1`.
+ * - `modulegaze-sessions.log` (active day) + daily `.zip` archives of prior days
+ * - `modulegaze-access.log` (active day, optional tee) + daily `.zip` archives
+ * - legacy `mf-*.tar.gz` files from earlier versions
  */
 export {
   DEFAULT_MODULEFETCH_DIR,
   getModuleFetchDir,
   MODULEGAZE_ACCESS_LOG_NAME,
+  MODULEGAZE_SESSION_LOG_NAME,
 } from "@/lib/moduleFetchPaths";
 export {
   appendModulegazeAccessLogLine,
@@ -41,11 +42,20 @@ export async function ensureModuleFetchDir(dir: string): Promise<void> {
 }
 
 function isModuleFetchArchive(name: string): boolean {
-  if (!name.startsWith("mf-")) return false;
-  return name.endsWith(".tar.gz") || name.endsWith(".zip");
+  if (name.startsWith("mf-")) {
+    return name.endsWith(".tar.gz") || name.endsWith(".zip");
+  }
+  if (
+    /^modulegaze-(?:access|sessions)-\d{4}-\d{2}-\d{2}(?:-\d+)?\.log(?:\.zip)?$/.test(
+      name
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
-/** Deletes `mf-*.tar.gz` (and legacy `mf-*.zip`) in `dir` older than one year. */
+/** Deletes old archived log artifacts in `dir` older than one year. */
 export async function purgeOldModuleFetchArchives(dir: string): Promise<number> {
   const now = Date.now();
   let removed = 0;
@@ -84,17 +94,22 @@ export async function maybePurgeOldArchives(dir: string): Promise<void> {
   await purgeOldModuleFetchArchives(dir);
 }
 
-function sanitizeFilePart(s: string, maxLen: number): string {
-  const out = s.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, maxLen);
-  return out.length > 0 ? out : "anon";
+function sanitizeLogField(s: string): string {
+  return s.replace(/[\r\n\t]+/g, " ").trim();
 }
 
-/**
- * Writes one `.tar.gz` per ingest: gzip-compressed tar with `modulefetch.json` at the
- * archive root (same logical layout as the former zip; path for downstream tools).
- */
-export async function writeModuleFetchSessionTarGz(
-  dir: string,
+function formatSessionLogLine(payload: ModuleFetchPayload): string {
+  return [
+    payload.recordedAt,
+    `userId=${sanitizeLogField(payload.userId)}`,
+    `moduleId=${sanitizeLogField(payload.moduleId)}`,
+    `durationSeconds=${Math.max(0, Math.round(payload.durationSeconds))}`,
+    `schemaVersion=${payload.schemaVersion}`,
+  ].join("\t");
+}
+
+/** Server-side ingest (same storage path as POST /api/modulefetch/ingest). */
+export async function persistModuleFetchRecord(
   payload: Omit<ModuleFetchPayload, "schemaVersion" | "recordedAt"> & {
     recordedAt?: string;
   }
@@ -106,39 +121,13 @@ export async function writeModuleFetchSessionTarGz(
     moduleId: payload.moduleId,
     durationSeconds: Math.round(Number(payload.durationSeconds)),
   };
-
-  const json = JSON.stringify(fullPayload, null, 2);
-  const stamp = fullPayload.recordedAt.replace(/[:.]/g, "-");
-  const rand = Math.random().toString(36).slice(2, 10);
-  const filename = `mf-${sanitizeFilePart(stamp, 48)}-${rand}.tar.gz`;
-  const outPath = path.join(dir, filename);
-
-  await new Promise<void>((resolve, reject) => {
-    const output = createWriteStream(outPath);
-    const archive = archiver("tar", {
-      gzip: true,
-      gzipOptions: { level: 9 },
-    });
-    archive.on("error", reject);
-    output.on("error", reject);
-    output.on("close", () => resolve());
-    archive.pipe(output);
-    archive.append(json, { name: "modulefetch.json" });
-    void archive.finalize().catch(reject);
-  });
-
-  return { filename };
-}
-
-/** Server-side ingest (same files as POST /api/modulefetch/ingest). */
-export async function persistModuleFetchRecord(
-  payload: Omit<ModuleFetchPayload, "schemaVersion" | "recordedAt"> & {
-    recordedAt?: string;
-  }
-): Promise<{ filename: string }> {
   const dir = getModuleFetchDir();
   await ensureModuleFetchDir(dir);
-  const out = await writeModuleFetchSessionTarGz(dir, payload);
+  const out = await appendLineWithDailyZip(
+    dir,
+    MODULEGAZE_SESSION_LOG_NAME,
+    formatSessionLogLine(fullPayload)
+  );
   void maybePurgeOldArchives(dir).catch((e) =>
     console.error("[modulefetch] retention purge failed:", e)
   );

@@ -9,6 +9,24 @@ import {
 // Ensure this route is dynamic
 export const dynamic = "force-dynamic"
 
+type ModulesApiResponse = {
+  modules: ScannedModuleRow[]
+  sources: {
+    mergedCount: number
+    database: {
+      ok: boolean
+      count: number
+      error: string | null
+    }
+    scan: {
+      enabled: boolean
+      root: string | null
+      count: number
+    }
+  }
+  warnings: string[]
+}
+
 /**
  * Optional: absolute path to the `uploads/modules` directory on the server
  * (parent of `<buildId>/<slug>/index.html`). Merges discovered slugs with DB rows.
@@ -16,6 +34,7 @@ export const dynamic = "force-dynamic"
  */
 export async function GET() {
   let dbModules: ScannedModuleRow[] = []
+  let dbError: string | null = null
   try {
     dbModules = await prisma.module.findMany({
       where: {
@@ -40,6 +59,7 @@ export async function GET() {
       },
     })
   } catch (error) {
+    dbError = error instanceof Error ? error.message : String(error)
     console.error("Error reading modules from database:", error)
   }
 
@@ -60,5 +80,36 @@ export async function GET() {
     a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
   )
 
-  return NextResponse.json(merged)
+  const warnings: string[] = []
+  if (dbError) {
+    warnings.push("Database module lookup failed; fallback sources may be incomplete.")
+  }
+  if (!root) {
+    warnings.push(
+      "MODULEGAZE_UPLOADS_MODULES_ROOT is not configured; disk-scanned modules are disabled."
+    )
+  }
+  if (merged.length === 0) {
+    warnings.push("No modules were discovered from database or disk scan sources.")
+  }
+
+  const payload: ModulesApiResponse = {
+    modules: merged,
+    sources: {
+      mergedCount: merged.length,
+      database: {
+        ok: !dbError,
+        count: dbModules.length,
+        error: dbError,
+      },
+      scan: {
+        enabled: Boolean(root),
+        root: root ?? null,
+        count: scanned.length,
+      },
+    },
+    warnings,
+  }
+
+  return NextResponse.json(payload)
 }

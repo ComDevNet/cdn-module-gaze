@@ -18,15 +18,9 @@ export async function appendModulegazeAccessLogLine(
   rawLine: string
 ): Promise<void> {
   if (!isAccessLogTeeEnabled()) return;
-  const fs = await import("fs/promises");
-  const path = await import("path");
+  const { appendLineWithDailyZip } = await import("./dailyLogArchive");
   const dir = getModuleFetchDir();
-  await fs.mkdir(dir, { recursive: true });
   const oneLine = rawLine.replace(/\r?\n/g, " ").trim();
-  const out = `${new Date().toISOString()}\t${oneLine}\n`;
-  await fs.appendFile(
-    path.join(dir, MODULEGAZE_ACCESS_LOG_NAME),
-    out,
-    "utf8"
-  );
+  const out = `${new Date().toISOString()}\t${oneLine}`;
+  await appendLineWithDailyZip(dir, MODULEGAZE_ACCESS_LOG_NAME, out);
 }

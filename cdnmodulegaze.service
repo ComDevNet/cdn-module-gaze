@@ -7,12 +7,18 @@ Type=simple
 User=root
 WorkingDirectory=/home/pi/cdn-module-gaze
 Environment=NODE_ENV=production
-# Track sessions + mf-*.tar.gz from journalctl as soon as Next starts (no browser required)
-# Environment=MODULEGAZE_BACKGROUND_MONITOR=1
+# Track sessions from journalctl as soon as Next starts (no browser required)
+Environment=MODULEGAZE_BACKGROUND_MONITOR=1
 # Append module-related oc4d lines to /var/log/modulegaze/modulegaze-access.log
-# Environment=MODULEGAZE_TEE_ACCESS_LOG=1
-# Optional zip snapshots while the UI tab is monitoring (no rebuild needed):
-# Environment=MODULEFETCH_PERIODIC_FLUSH_MINUTES=5
+Environment=MODULEGAZE_TEE_ACCESS_LOG=1
+# Start follow mode from today's logs (set to "all" for full journal history)
+Environment=MODULEGAZE_JOURNAL_SINCE=today
+# Periodic ingest flush while UI monitoring is enabled (minutes)
+Environment=MODULEFETCH_PERIODIC_FLUSH_MINUTES=5
+# Directory for modulegaze-access.log and modulegaze-sessions.log
+Environment=MODULEFETCH_LOG_DIR=/var/log/modulegaze
+# Optional: scan modules on disk in addition to DB rows
+# Environment=MODULEGAZE_UPLOADS_MODULES_ROOT=/var/www/oc4d.cdn/uploads/modules
 ExecStart=/home/pi/.bun/bin/bun run start
 Restart=always
 RestartSec=10
