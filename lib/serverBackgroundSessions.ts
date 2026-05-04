@@ -65,12 +65,40 @@ function persistEndedSessionRow(row: Row, endedAtMs: number): void {
     );
 }
 
+/**
+ * When a logged-in user appears at an IP that still has a `Guest` session,
+ * collapse the Guest into the logged-in identity. Without this, the same
+ * browser shows up twice in the live-sessions panel (once as Guest, once
+ * as the real name) until the stale Guest row ages out 5 minutes later.
+ *
+ * Heuristic is simple: same IP, Guest username, any module. On a typical
+ * LAN deployment each device gets its own IP so this is the right call;
+ * if multi-user-per-IP behind NAT becomes common we can tighten to a
+ * recency window.
+ */
+function endGuestRowForIpIfPresent(ip: string, atMs: number): void {
+  const guestIdx = state.rows.findIndex(
+    (r) => r.ip === ip && r.username === "Guest"
+  );
+  if (guestIdx < 0) return;
+  const guest = state.rows[guestIdx];
+  if (guest) persistEndedSessionRow(guest, atMs);
+  state.rows.splice(guestIdx, 1);
+}
+
 function updateOrInsertSession(
   ip: string,
   username: string,
   module: string
 ): void {
   const now = Date.now();
+
+  // If a real user is showing up at this IP, retire any Guest row at the
+  // same IP — they were almost certainly the same browser pre-signin.
+  if (username !== "Guest") {
+    endGuestRowForIpIfPresent(ip, now);
+  }
+
   const idx = state.rows.findIndex(
     (r) => r.ip === ip && r.username === username
   );
@@ -118,26 +146,38 @@ function touchSession(
     return;
   }
 
-  // No session for this exact `(ip, user, module)`. Two scenarios:
+  // No session for this exact `(ip, user, module)`. Three scenarios:
   //
   //   a) Cold start: monitor is just coming up and the user was already
-  //      reading a module before we attached. There is NO active session
-  //      for this user yet → seed one from this heartbeat so they show up.
+  //      reading a module before we attached. There is no session for
+  //      this user yet → seed one from this heartbeat so they show up.
   //
-  //   b) Unrelated asset: user is viewing module X, and their browser is
-  //      pulling a thumbnail or preview from module Y under
-  //      `/uploads/modules/<buildId>/Y/...`. Y matches the asset-slug
-  //      regex even though the user never navigated to Y. We must NOT
-  //      seed a session for Y — doing so would persist X with ~0
-  //      duration and replace it with Y, which then thrashes again on
-  //      the next thumbnail. (This was the bug behind dozens of
-  //      `durationSeconds=0` records in modulegaze-sessions.log.)
+  //   b) Unrelated asset (thumbnail fanout): user is viewing module X,
+  //      and their browser is pulling a thumbnail or preview from
+  //      module Y under `/uploads/modules/<buildId>/Y/...`. Y matches
+  //      the asset-slug regex even though the user never navigated to
+  //      Y. Seeding a session for Y would persist X with ~0 duration
+  //      and replace it with Y — that was the bug behind dozens of
+  //      `durationSeconds=0` records in modulegaze-sessions.log.
   //
-  // Distinguish the two by whether the user already has any session.
-  const userHasActiveSession = state.rows.some(
-    (r) => r.ip === ip && r.username === username
+  //   c) Stale Guest log line after sign-in: a Guest hit that was
+  //      issued before the user signed in arrives after their
+  //      logged-in session has already taken over the IP. Re-creating
+  //      a Guest row at that IP would bring the duplicate Guest +
+  //      logged-in pair right back.
+  //
+  // For logged-in users we only need to guard against (b): scope the
+  // "already active" check to the same username so a logged-in user
+  // sharing an IP with someone else is still seedable.
+  // For Guests we additionally guard against (c) by widening the
+  // check to ANY username at this IP — late Guest log lines at an IP
+  // owned by a logged-in user are dropped on the floor.
+  const blocked = state.rows.some((r) =>
+    username === "Guest"
+      ? r.ip === ip
+      : r.ip === ip && r.username === username
   );
-  if (userHasActiveSession) return;
+  if (blocked) return;
   updateOrInsertSession(ip, username, moduleSlug);
 }
 

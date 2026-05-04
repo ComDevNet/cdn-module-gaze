@@ -118,6 +118,75 @@ test("cold-start case: heartbeat seeds a session when the user has none", () => 
   assert.equal(snap[0]?.module, "cdn_geo");
 });
 
+test("logged-in user at the same IP retires the existing Guest session (sign-in promotion)", () => {
+  // Same browser was Guest, then signed in. We must end up with ONE
+  // session row for that IP, not two (Guest + signed-in name) — the
+  // dashboard was previously showing both until Guest aged out.
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.227", "anonymous", "en-w3schools")
+  );
+  let snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 1);
+  assert.equal(snap[0]?.username, "Guest");
+  assert.equal(snap[0]?.module, "en-w3schools");
+
+  processBackgroundJournalLine(
+    entryLine("192.168.1.227", "anna@example.com", "CDN_Module")
+  );
+  snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 1, "Guest row at the same IP must be retired");
+  assert.equal(snap[0]?.username, "anna@example.com");
+  assert.equal(snap[0]?.module, "CDN_Module");
+});
+
+test("Guest at a DIFFERENT IP is not affected by another user's sign-in", () => {
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.227", "anonymous", "en-w3schools")
+  );
+  processBackgroundJournalLine(
+    entryLine("192.168.1.165", "anna@example.com", "CDN_Module")
+  );
+  const snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 2);
+  const guest = snap.find((s) => s.ip === "192.168.1.227");
+  assert.equal(guest?.username, "Guest");
+  assert.equal(guest?.module, "en-w3schools");
+});
+
+test("late Guest heartbeat at an IP owned by a logged-in user is dropped (no flicker)", () => {
+  // Sign-in race: a Guest log line issued just before sign-in lands a
+  // moment after the logged-in entry has already retired the Guest
+  // row. We must NOT recreate the Guest row, otherwise the duplicate
+  // appears in the dashboard for up to 5 minutes.
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.227", "anna@example.com", "CDN_Module")
+  );
+  processBackgroundJournalLine(
+    assetHeartbeat("192.168.1.227", "anonymous", "en-w3schools")
+  );
+  const snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 1);
+  assert.equal(snap[0]?.username, "anna@example.com");
+});
+
+test("cold-start heartbeat for a logged-in user also retires a Guest at the same IP", () => {
+  // Sign-in flow can race so the first signal we see for the logged-in
+  // user might be an asset heartbeat rather than an entry hit.
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.227", "anonymous", "en-w3schools")
+  );
+  processBackgroundJournalLine(
+    assetHeartbeat("192.168.1.227", "anna@example.com", "CDN_Module")
+  );
+  const snap = getLiveSessionsSnapshot();
+  assert.equal(snap.length, 1);
+  assert.equal(snap[0]?.username, "anna@example.com");
+});
+
 test("two users on different modules each keep their own session against thumbnail fanout", () => {
   clearBackgroundSessions();
   processBackgroundJournalLine(
