@@ -5,16 +5,55 @@ let cache = new Map<string, string>();
 let lastLoadMs = 0;
 const TTL_MS = 60_000;
 
-export async function refreshUserPoolCache(force = false): Promise<void> {
-  const now = Date.now();
-  if (!force && lastLoadMs > 0 && now - lastLoadMs < TTL_MS) return;
+type UserPoolRow = {
+  email: string;
+  name: string;
+};
+
+async function loadUserPoolRows(): Promise<UserPoolRow[]> {
   try {
     const rows = await prisma.user.findMany({
       select: { email: true, name: true },
     });
+    return rows
+      .map((r) => ({
+        email: r.email,
+        name: r.name,
+      }))
+      .filter((r) => typeof r.email === "string" && typeof r.name === "string");
+  } catch (firstError) {
+    // Compatibility fallback for deployments where the DB column is `full_name`.
+    try {
+      const rows = await prisma.$queryRaw<UserPoolRow[]>`
+        SELECT email, full_name AS name
+        FROM "User"
+        WHERE email IS NOT NULL AND full_name IS NOT NULL
+      `;
+      return rows
+        .map((r) => ({
+          email: r.email,
+          name: r.name,
+        }))
+        .filter((r) => typeof r.email === "string" && typeof r.name === "string");
+    } catch (fallbackError) {
+      console.error("[userPool] primary load failed:", firstError);
+      console.error("[userPool] full_name fallback failed:", fallbackError);
+      return [];
+    }
+  }
+}
+
+export async function refreshUserPoolCache(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && lastLoadMs > 0 && now - lastLoadMs < TTL_MS) return;
+  try {
+    const rows = await loadUserPoolRows();
     const next = new Map<string, string>();
     for (const r of rows) {
-      next.set(normalizeUserPoolLookupKey(r.email), r.name.trim());
+      const email = r.email.trim();
+      const displayName = r.name.trim();
+      if (!email || !displayName) continue;
+      next.set(normalizeUserPoolLookupKey(email), displayName);
     }
     cache = next;
     lastLoadMs = now;

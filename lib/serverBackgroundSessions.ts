@@ -19,6 +19,25 @@ function userIdFor(row: Row): string {
   return `${row.username}|${row.ip}`;
 }
 
+function persistEndedSessionRow(row: Row, endedAtMs: number): void {
+  const durationSeconds = Math.max(0, Math.floor((endedAtMs - row.startTimeMs) / 1000));
+  void import(
+    /* webpackIgnore: true */
+    "./moduleFetchStore"
+  )
+    .then(({ persistModuleFetchRecord }) =>
+      persistModuleFetchRecord({
+        userId: userIdFor(row),
+        moduleId: row.module,
+        durationSeconds,
+        recordedAt: new Date(endedAtMs).toISOString(),
+      })
+    )
+    .catch((e) =>
+      console.error("[serverBackgroundSessions] persist failed:", e)
+    );
+}
+
 function updateOrInsertSession(ip: string, username: string, module: string): void {
   const now = Date.now();
   const idx = rows.findIndex((r) => r.ip === ip && r.username === username);
@@ -26,6 +45,8 @@ function updateOrInsertSession(ip: string, username: string, module: string): vo
     const existing = rows[idx];
     if (!existing) return;
     if (existing.module !== module) {
+      // Keep per-user module history when they navigate between modules.
+      persistEndedSessionRow(existing, now);
       rows[idx] = {
         ip,
         username,
@@ -86,24 +107,7 @@ export function runBackgroundSessionCleanup(): void {
   }
   rows = kept;
   for (const r of removed) {
-    const durationSeconds = Math.max(
-      0,
-      Math.floor((Date.now() - r.startTimeMs) / 1000)
-    );
-    void import(
-      /* webpackIgnore: true */
-      "./moduleFetchStore"
-    )
-      .then(({ persistModuleFetchRecord }) =>
-        persistModuleFetchRecord({
-          userId: userIdFor(r),
-          moduleId: r.module,
-          durationSeconds,
-        })
-      )
-      .catch((e) =>
-        console.error("[serverBackgroundSessions] persist failed:", e)
-      );
+    persistEndedSessionRow(r, Date.now());
   }
 }
 

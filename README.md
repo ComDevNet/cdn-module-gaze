@@ -144,7 +144,7 @@ MODULEGAZE_BACKGROUND_MONITOR=1
 MODULEGAZE_TEE_ACCESS_LOG=1
 MODULEGAZE_JOURNAL_SINCE=today
 MODULEFETCH_LOG_DIR=/var/log/modulegaze
-MODULEGAZE_UPLOADS_MODULES_ROOT=/var/www/oc4d.cdn/uploads/modules
+MODULEGAZE_UPLOADS_MODULES_ROOT=/oc4d-server/workspaces/website/uploads/modules
 ```
 
 ### 7. Raspberry Pi verification checklist

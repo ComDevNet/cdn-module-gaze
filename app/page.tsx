@@ -41,6 +41,7 @@ interface UserSession {
 
 interface ModuleTimer {
   moduleName: string;
+  moduleSlug: string;
   timeLimit: number; // in minutes
   isActive: boolean;
 }
@@ -78,6 +79,7 @@ interface ModulesApiPayload {
     scan?: {
       enabled?: boolean;
       root?: string | null;
+      rootsTried?: string[];
       count?: number;
     };
   };
@@ -87,7 +89,7 @@ interface ModulesApiPayload {
 export default function CDNModuleMonitor() {
   const [userSessions, setUserSessions] = useState<UserSession[]>([]);
   const [moduleTimers, setModuleTimers] = useState<ModuleTimer[]>([
-    { moduleName: "default", timeLimit: 1, isActive: false },
+    { moduleName: "default", moduleSlug: "default", timeLimit: 1, isActive: false },
   ]);
   const [stats, setStats] = useState<Stats>({
     totalModules: 0,
@@ -98,6 +100,7 @@ export default function CDNModuleMonitor() {
   const [alerts, setAlerts] = useState<string[]>([]);
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [selectedModule, setSelectedModule] = useState("");
+  const [selectedModuleSlug, setSelectedModuleSlug] = useState("");
   const [timerMinutes, setTimerMinutes] = useState("");
   const [modules, setModules] = useState<Module[]>([]);
   /** Normalized login_key → display_name from GET /api/user-pool */
@@ -134,23 +137,48 @@ export default function CDNModuleMonitor() {
     [userPoolMap]
   );
 
+  const normalizeModuleKey = useCallback((value: string) => {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[_\s]+/g, "-")
+      .replace(/[^a-z0-9-]/g, "");
+  }, []);
+
+  const getModuleSlug = useCallback(
+    (module: Module): string => extractModuleIdFromPath(module.indexHtmlUrl) ?? module.name,
+    []
+  );
+
   // Find matching module from database based on log module name (slug or URL segment)
   const findMatchingModule = useCallback((logModuleName: string): Module | null => {
-    const bySlug = modules.find((module) => {
-      const moduleId = extractModuleIdFromPath(module.indexHtmlUrl);
-      return moduleId === logModuleName;
-    });
-    if (bySlug) return bySlug;
+    const normalizedLogKey = normalizeModuleKey(logModuleName);
+    if (!normalizedLogKey) return null;
 
-    return (
-      modules.find(
-        (m) =>
-          m.indexHtmlUrl.includes(`/modules/${logModuleName}/`) ||
-          (m.indexHtmlUrl.includes("/uploads/modules/") &&
-            m.indexHtmlUrl.includes(`/${logModuleName}/`))
-      ) || null
+    const byExactSlug = modules.find(
+      (module) => normalizeModuleKey(getModuleSlug(module)) === normalizedLogKey
     );
-  }, [modules]);
+    if (byExactSlug) return byExactSlug;
+
+    const byPathContains = modules.find(
+      (m) =>
+        m.indexHtmlUrl.includes(`/modules/${logModuleName}/`) ||
+        (m.indexHtmlUrl.includes("/uploads/modules/") &&
+          m.indexHtmlUrl.includes(`/${logModuleName}/`))
+    );
+    if (byPathContains) return byPathContains;
+
+    const slugPrefixMatches = modules.filter((module) => {
+      const slugKey = normalizeModuleKey(getModuleSlug(module));
+      return (
+        slugKey.startsWith(`${normalizedLogKey}-`) ||
+        normalizedLogKey.startsWith(`${slugKey}-`)
+      );
+    });
+    if (slugPrefixMatches.length === 1) return slugPrefixMatches[0];
+
+    return null;
+  }, [modules, getModuleSlug, normalizeModuleKey]);
 
   // Get display name for a module (from DB if matched, otherwise use log name)
   const getDisplayName = useCallback(
@@ -165,54 +193,56 @@ export default function CDNModuleMonitor() {
   const findTimerForSession = useCallback((session: UserSession): ModuleTimer | null => {
     const logModuleName = session.module;
     const matchedModule = findMatchingModule(logModuleName);
+    const normalizedLogModule = normalizeModuleKey(logModuleName);
 
     // Debug logging
     const debugMsg = `🔍 Finding timer for session: ${logModuleName}`;
     console.log(debugMsg);
 
-    // Try 1: Direct match with log module name
+    // Try 1: Direct slug/name match against stored timer
     let timer = moduleTimers.find(
-      (t) => t.moduleName === logModuleName && t.isActive
+      (t) =>
+        t.isActive &&
+        (normalizeModuleKey(t.moduleSlug) === normalizedLogModule ||
+          normalizeModuleKey(t.moduleName) === normalizedLogModule)
     );
     if (timer) {
       console.log(
-        `✅ Found timer via direct log match: ${timer.moduleName} (${timer.timeLimit}m)`
+        `✅ Found timer via direct slug/name match: ${timer.moduleName} (${timer.timeLimit}m)`
       );
       return timer;
     }
 
-    // Try 2: Match with database module name
+    // Try 2: Match with resolved module (title + slug)
     if (matchedModule) {
+      const matchedSlug = normalizeModuleKey(getModuleSlug(matchedModule));
       timer = moduleTimers.find(
-        (t) => t.moduleName === matchedModule.name && t.isActive
+        (t) =>
+          t.isActive &&
+          (normalizeModuleKey(t.moduleName) === normalizeModuleKey(matchedModule.name) ||
+            normalizeModuleKey(t.moduleSlug) === matchedSlug)
       );
       if (timer) {
         console.log(
-          `✅ Found timer via DB module match: ${timer.moduleName} (${timer.timeLimit}m)`
+          `✅ Found timer via resolved module match: ${timer.moduleName} (${timer.timeLimit}m)`
         );
         return timer;
       }
     }
 
-    // Try 3: Check if any timer's module name matches the URL ID of our log module
-    const logModuleUrlId = logModuleName; // The log module name IS the URL ID
-    timer = moduleTimers.find((t) => {
+    // Try 3: Prefix fallback (e.g. "en" vs "en-educate")
+    const fuzzyCandidates = moduleTimers.filter((t) => {
       if (!t.isActive) return false;
-
-      // Find the module in DB that has this timer name
-      const timerModule = modules.find((m) => m.name === t.moduleName);
-      if (timerModule) {
-        const timerModuleUrlId = extractModuleIdFromPath(
-          timerModule.indexHtmlUrl
-        );
-        return timerModuleUrlId === logModuleUrlId;
-      }
-      return false;
+      const key = normalizeModuleKey(t.moduleSlug || t.moduleName);
+      return (
+        key.startsWith(`${normalizedLogModule}-`) ||
+        normalizedLogModule.startsWith(`${key}-`)
+      );
     });
-
-    if (timer) {
+    if (fuzzyCandidates.length === 1) {
+      timer = fuzzyCandidates[0];
       console.log(
-        `✅ Found timer via reverse URL match: ${timer.moduleName} (${timer.timeLimit}m)`
+        `✅ Found timer via fuzzy slug match: ${timer.moduleName} (${timer.timeLimit}m)`
       );
       return timer;
     }
@@ -220,11 +250,13 @@ export default function CDNModuleMonitor() {
     console.log(`❌ No timer found for: ${logModuleName}`);
     console.log(
       `Available active timers:`,
-      moduleTimers.filter((t) => t.isActive).map((t) => t.moduleName)
+      moduleTimers
+        .filter((t) => t.isActive)
+        .map((t) => `${t.moduleName}[${t.moduleSlug}]`)
     );
 
     return null;
-  }, [modules, moduleTimers, findMatchingModule]);
+  }, [moduleTimers, findMatchingModule, getModuleSlug, normalizeModuleKey]);
 
   // Update user session (one row per IP + username from oc4d remote-user field)
   const updateUserSession = useCallback((ip: string, username: string, module: string) => {
@@ -239,6 +271,21 @@ export default function CDNModuleMonitor() {
         const existing = updated[existingIndex];
 
         if (existing.module !== module) {
+          // Persist the previous module before switching, so history includes
+          // every module a user opened (not only their current module).
+          const endedAt = now.getTime();
+          const durationSeconds = Math.max(
+            0,
+            Math.floor((endedAt - existing.startTime.getTime()) / 1000)
+          );
+          queueMicrotask(() => {
+            void postModulefetchIngest({
+              userId: sessionToModulefetchUserId(existing),
+              moduleId: existing.module,
+              durationSeconds,
+              recordedAt: new Date(endedAt).toISOString(),
+            });
+          });
           updated[existingIndex] = {
             ip,
             username,
@@ -291,31 +338,33 @@ export default function CDNModuleMonitor() {
   );
 
   const addModuleTimer = () => {
-    if (selectedModule && timerMinutes) {
+    if (selectedModule && selectedModuleSlug && timerMinutes) {
       const timer: ModuleTimer = {
         moduleName: selectedModule,
+        moduleSlug: selectedModuleSlug,
         timeLimit: Number.parseInt(timerMinutes),
         isActive: true,
       };
       setModuleTimers((prev) => {
-        // Remove existing timer for this module if it exists
-        const filtered = prev.filter((t) => t.moduleName !== selectedModule);
+        // Remove existing timer for this module slug if it exists
+        const filtered = prev.filter((t) => t.moduleSlug !== selectedModuleSlug);
         const newTimers = [...filtered, timer];
 
         // Debug log
         console.log(
-          `🎯 Added/Updated timer: ${selectedModule} -> ${timerMinutes}m`
+          `🎯 Added/Updated timer: ${selectedModule} [${selectedModuleSlug}] -> ${timerMinutes}m`
         );
         console.log(
           `Active timers:`,
           newTimers
             .filter((t) => t.isActive)
-            .map((t) => `${t.moduleName}(${t.timeLimit}m)`)
+            .map((t) => `${t.moduleName}[${t.moduleSlug}](${t.timeLimit}m)`)
         );
 
         return newTimers;
       });
       setSelectedModule("");
+      setSelectedModuleSlug("");
       setTimerMinutes("");
       setSearchTerm("");
       setIsDropdownOpen(false);
@@ -766,28 +815,34 @@ export default function CDNModuleMonitor() {
   });
 
   // Check if module has a timer set
-  const hasTimer = (moduleName: string) => {
+  const hasTimer = (module: Module) => {
+    const slug = normalizeModuleKey(getModuleSlug(module));
     return moduleTimers.some(
       (timer) =>
-        timer.moduleName === moduleName && timer.moduleName !== "default"
+        normalizeModuleKey(timer.moduleSlug) === slug &&
+        timer.moduleSlug !== "default"
     );
   };
 
   // Get existing timer for module
-  const getExistingTimer = (moduleName: string) => {
+  const getExistingTimer = (module: Module) => {
+    const slug = normalizeModuleKey(getModuleSlug(module));
     return moduleTimers.find(
       (timer) =>
-        timer.moduleName === moduleName && timer.moduleName !== "default"
+        normalizeModuleKey(timer.moduleSlug) === slug &&
+        timer.moduleSlug !== "default"
     );
   };
 
-  const handleModuleSelect = (moduleName: string) => {
-    setSelectedModule(moduleName);
-    setSearchTerm(moduleName);
+  const handleModuleSelect = (module: Module) => {
+    const slug = getModuleSlug(module);
+    setSelectedModule(module.name);
+    setSelectedModuleSlug(slug);
+    setSearchTerm(module.name);
     setIsDropdownOpen(false);
 
     // If module already has a timer, populate the time field
-    const existingTimer = getExistingTimer(moduleName);
+    const existingTimer = getExistingTimer(module);
     if (existingTimer) {
       setTimerMinutes(existingTimer.timeLimit.toString());
     } else {
@@ -813,6 +868,15 @@ export default function CDNModuleMonitor() {
 
   // Get timer limit for a specific module
   const getModuleTimeLimit = (moduleName: string) => {
+    const normalizedInput = normalizeModuleKey(moduleName);
+    const direct = moduleTimers.find(
+      (timer) =>
+        timer.isActive &&
+        (normalizeModuleKey(timer.moduleSlug) === normalizedInput ||
+          normalizeModuleKey(timer.moduleName) === normalizedInput)
+    );
+    if (direct) return direct.timeLimit;
+
     const dummySession: UserSession = {
       ip: "",
       username: "",
@@ -965,11 +1029,9 @@ export default function CDNModuleMonitor() {
                           </div>
                         ) : filteredModules.length > 0 ? (
                           filteredModules.map((module) => {
-                            const hasExistingTimer = hasTimer(module.name);
-                            const existingTimer = getExistingTimer(module.name);
-                            const moduleUrlId = extractModuleIdFromPath(
-                              module.indexHtmlUrl
-                            );
+                            const hasExistingTimer = hasTimer(module);
+                            const existingTimer = getExistingTimer(module);
+                            const moduleUrlId = getModuleSlug(module);
 
                             return (
                               <div
@@ -979,7 +1041,7 @@ export default function CDNModuleMonitor() {
                                     ? "border-l-orange-400 bg-orange-50"
                                     : "border-l-transparent"
                                 }`}
-                                onClick={() => handleModuleSelect(module.name)}
+                                onClick={() => handleModuleSelect(module)}
                               >
                                 <div className="flex items-center justify-between">
                                   <div className="flex-1">
@@ -1015,7 +1077,7 @@ export default function CDNModuleMonitor() {
                                         {existingTimer?.timeLimit}m
                                       </Badge>
                                     )}
-                                    {selectedModule === module.name && (
+                                    {selectedModuleSlug === moduleUrlId && (
                                       <Check className="h-4 w-4 text-orange-600" />
                                     )}
                                   </div>
@@ -1051,9 +1113,17 @@ export default function CDNModuleMonitor() {
                       size="sm"
                       onClick={addModuleTimer}
                       className="bg-orange-600 hover:bg-orange-700 text-white"
-                      disabled={!selectedModule || !timerMinutes}
+                      disabled={!selectedModuleSlug || !timerMinutes}
                     >
-                      {hasTimer(selectedModule) ? "Update" : "Set Limit"}
+                      {selectedModuleSlug &&
+                      moduleTimers.some(
+                        (t) =>
+                          normalizeModuleKey(t.moduleSlug) ===
+                            normalizeModuleKey(selectedModuleSlug) &&
+                          t.moduleSlug !== "default"
+                      )
+                        ? "Update"
+                        : "Set Limit"}
                     </Button>
                   </div>
                 </div>

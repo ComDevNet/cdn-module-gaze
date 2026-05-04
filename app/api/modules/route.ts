@@ -21,11 +21,17 @@ type ModulesApiResponse = {
     scan: {
       enabled: boolean
       root: string | null
+      rootsTried: string[]
       count: number
     }
   }
   warnings: string[]
 }
+
+const DEFAULT_UPLOADS_MODULES_ROOTS = [
+  "/oc4d-server/workspaces/website/uploads/modules",
+  "/var/www/oc4d.cdn/uploads/modules",
+]
 
 /**
  * Optional: absolute path to the `uploads/modules` directory on the server
@@ -37,9 +43,6 @@ export async function GET() {
   let dbError: string | null = null
   try {
     dbModules = await prisma.module.findMany({
-      where: {
-        enabled: true,
-      },
       select: {
         id: true,
         name: true,
@@ -63,8 +66,23 @@ export async function GET() {
     console.error("Error reading modules from database:", error)
   }
 
-  const root = process.env.MODULEGAZE_UPLOADS_MODULES_ROOT?.trim()
-  const scanned = root ? await scanUploadsModulesLayout(root) : []
+  const configuredRoot = process.env.MODULEGAZE_UPLOADS_MODULES_ROOT?.trim()
+  const rootsTried = configuredRoot
+    ? [configuredRoot]
+    : DEFAULT_UPLOADS_MODULES_ROOTS
+
+  const scannedBySlug = new Map<string, ScannedModuleRow>()
+  for (const rootCandidate of rootsTried) {
+    const rows = await scanUploadsModulesLayout(rootCandidate)
+    for (const row of rows) {
+      const slug = extractModuleIdFromPath(row.indexHtmlUrl)
+      const key = slug && slug.length > 0 ? slug : row.id
+      if (!scannedBySlug.has(key)) {
+        scannedBySlug.set(key, row)
+      }
+    }
+  }
+  const scanned = Array.from(scannedBySlug.values())
 
   const dbSlugs = new Set(
     dbModules
@@ -84,9 +102,9 @@ export async function GET() {
   if (dbError) {
     warnings.push("Database module lookup failed; fallback sources may be incomplete.")
   }
-  if (!root) {
+  if (configuredRoot && scanned.length === 0) {
     warnings.push(
-      "MODULEGAZE_UPLOADS_MODULES_ROOT is not configured; disk-scanned modules are disabled."
+      `No modules were found under MODULEGAZE_UPLOADS_MODULES_ROOT (${configuredRoot}).`
     )
   }
   if (merged.length === 0) {
@@ -103,8 +121,9 @@ export async function GET() {
         error: dbError,
       },
       scan: {
-        enabled: Boolean(root),
-        root: root ?? null,
+        enabled: rootsTried.length > 0,
+        root: configuredRoot ?? rootsTried[0] ?? null,
+        rootsTried,
         count: scanned.length,
       },
     },
