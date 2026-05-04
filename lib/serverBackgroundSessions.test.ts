@@ -45,6 +45,31 @@ test("entry log creates a session for the user", () => {
   assert.equal(snap[0]?.module, "cdn_math");
 });
 
+test("live snapshot duration freezes at lastActivityMs (does not tick up while idle)", async () => {
+  // Regression: `duration` used to be `now - startTimeMs`, so an idle
+  // user kept appearing to advance their time-on-module right up to the
+  // 5-min idle-timeout, even after they had closed the tab. New
+  // semantics: `duration = lastActivityMs - startTimeMs`, so once the
+  // user goes idle the live counter freezes at last evidence of
+  // presence. (Phase-2 heartbeats keep this fresh while the tab is open.)
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.20", "anna@example.com", "cdn_math")
+  );
+  const initial = getLiveSessionsSnapshot()[0]!;
+  // Wait long enough that `now - startTimeMs` would clearly differ from
+  // `lastActivityMs - startTimeMs` if the bug were still present.
+  await new Promise((r) => setTimeout(r, 1100));
+  const idle = getLiveSessionsSnapshot()[0]!;
+  assert.equal(
+    idle.duration,
+    initial.duration,
+    "duration must not advance while the session is idle"
+  );
+  assert.equal(idle.duration, 0);
+  assert.equal(idle.lastActivity, initial.lastActivity);
+});
+
 test("matching-module asset heartbeat bumps lastActivity, does not duplicate the session", () => {
   clearBackgroundSessions();
   processBackgroundJournalLine(

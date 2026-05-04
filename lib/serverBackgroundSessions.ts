@@ -208,8 +208,16 @@ export function runBackgroundSessionCleanup(): void {
   // a reference to `state.rows` keeps observing the latest contents.
   state.rows.length = 0;
   for (const r of kept) state.rows.push(r);
+  // Use `lastActivityMs` (not `Date.now()`) as the end-of-session timestamp.
+  // The 5-minute idle window between "user actually left" and "cleanup
+  // fires" was previously inflating every closed-tab record by up to
+  // SESSION_INACTIVITY_MS. With this change a session that was last
+  // active at T ends with duration = T - startTimeMs, regardless of when
+  // the cleanup sweep happens to fire. (Pure-static HTML pages will
+  // undercount until Phase-2 browser heartbeats land — those bump
+  // `lastActivityMs` every 30s while the tab is visible.)
   for (const r of removed) {
-    persistEndedSessionRow(r, Date.now());
+    persistEndedSessionRow(r, r.lastActivityMs);
   }
 }
 
@@ -225,7 +233,6 @@ export type LiveSessionSnapshot = {
 };
 
 export function getLiveSessionsSnapshot(): LiveSessionSnapshot[] {
-  const now = Date.now();
   return state.rows.map((r) => ({
     ip: r.ip,
     username: r.username,
@@ -233,6 +240,16 @@ export function getLiveSessionsSnapshot(): LiveSessionSnapshot[] {
     module: r.module,
     startTime: new Date(r.startTimeMs).toISOString(),
     lastActivity: new Date(r.lastActivityMs).toISOString(),
-    duration: Math.floor((now - r.startTimeMs) / 1000),
+    // Tracking time is bounded by the last signal we have for this user.
+    // Using `now - startTimeMs` would keep ticking up after the user
+    // closed their tab (we have no way to know they're gone until idle
+    // timeout fires). Anchoring duration to `lastActivityMs` instead
+    // freezes the counter at the last evidence of presence — accurate
+    // for games/video/interactive modules that emit ongoing requests,
+    // and conservative for static pages until Phase-2 heartbeats land.
+    duration: Math.max(
+      0,
+      Math.floor((r.lastActivityMs - r.startTimeMs) / 1000)
+    ),
   }));
 }
