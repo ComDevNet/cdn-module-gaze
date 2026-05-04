@@ -43,6 +43,10 @@ function persistEndedSessionRow(row: Row, endedAtMs: number): void {
     0,
     Math.floor((endedAtMs - row.startTimeMs) / 1000)
   );
+  // 0-second records are meaningless — they happen when a module is
+  // replaced within sub-second of being seeded (e.g. legacy heartbeat
+  // thrashing). Don't pollute modulegaze-sessions.log with them.
+  if (durationSeconds === 0) return;
   // Plain dynamic import (no `webpackIgnore`): let webpack create a real
   // chunk so the runtime path resolves under `.next/server/chunks/...`.
   // With `webpackIgnore: true` the literal "./moduleFetchStore" string
@@ -107,15 +111,34 @@ function touchSession(
     (r) =>
       r.ip === ip && r.username === username && r.module === moduleSlug
   );
-  if (idx < 0) {
-    // Background monitor can start after users already opened modules.
-    // Allow asset heartbeats to seed active sessions.
-    updateOrInsertSession(ip, username, moduleSlug);
+  if (idx >= 0) {
+    const r = state.rows[idx];
+    if (!r) return;
+    state.rows[idx] = { ...r, lastActivityMs: now };
     return;
   }
-  const r = state.rows[idx];
-  if (!r) return;
-  state.rows[idx] = { ...r, lastActivityMs: now };
+
+  // No session for this exact `(ip, user, module)`. Two scenarios:
+  //
+  //   a) Cold start: monitor is just coming up and the user was already
+  //      reading a module before we attached. There is NO active session
+  //      for this user yet → seed one from this heartbeat so they show up.
+  //
+  //   b) Unrelated asset: user is viewing module X, and their browser is
+  //      pulling a thumbnail or preview from module Y under
+  //      `/uploads/modules/<buildId>/Y/...`. Y matches the asset-slug
+  //      regex even though the user never navigated to Y. We must NOT
+  //      seed a session for Y — doing so would persist X with ~0
+  //      duration and replace it with Y, which then thrashes again on
+  //      the next thumbnail. (This was the bug behind dozens of
+  //      `durationSeconds=0` records in modulegaze-sessions.log.)
+  //
+  // Distinguish the two by whether the user already has any session.
+  const userHasActiveSession = state.rows.some(
+    (r) => r.ip === ip && r.username === username
+  );
+  if (userHasActiveSession) return;
+  updateOrInsertSession(ip, username, moduleSlug);
 }
 
 export function processBackgroundJournalLine(line: string): void {
