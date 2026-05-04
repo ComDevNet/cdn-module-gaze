@@ -10,8 +10,43 @@ type UserPoolRow = {
   name: string;
 };
 
+type UserColumnRow = {
+  column_name: string;
+};
+
+async function resolveUserDisplayColumn(): Promise<"name" | "full_name" | null> {
+  try {
+    const cols = await prisma.$queryRaw<UserColumnRow[]>`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'User'
+        AND column_name IN ('name', 'full_name')
+    `;
+    const names = new Set(cols.map((c) => c.column_name));
+    if (names.has("name")) return "name";
+    if (names.has("full_name")) return "full_name";
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadUserPoolRows(): Promise<UserPoolRow[]> {
   try {
+    const displayCol = await resolveUserDisplayColumn();
+    if (displayCol) {
+      const rows = await prisma.$queryRawUnsafe<UserPoolRow[]>(
+        `SELECT email, ${displayCol} AS name FROM "User" WHERE email IS NOT NULL AND ${displayCol} IS NOT NULL`
+      );
+      return rows
+        .map((r) => ({
+          email: r.email,
+          name: r.name,
+        }))
+        .filter((r) => typeof r.email === "string" && typeof r.name === "string");
+    }
+
     const rows = await prisma.user.findMany({
       select: { email: true, name: true },
     });
@@ -22,7 +57,7 @@ async function loadUserPoolRows(): Promise<UserPoolRow[]> {
       }))
       .filter((r) => typeof r.email === "string" && typeof r.name === "string");
   } catch (firstError) {
-    // Compatibility fallback for deployments where the DB column is `full_name`.
+    // Compatibility fallback for deployments where introspection failed but full_name exists.
     try {
       const rows = await prisma.$queryRaw<UserPoolRow[]>`
         SELECT email, full_name AS name

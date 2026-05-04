@@ -42,7 +42,7 @@ export async function GET() {
   let dbModules: ScannedModuleRow[] = []
   let dbError: string | null = null
   try {
-    dbModules = await prisma.module.findMany({
+    const rawModules = await prisma.module.findMany({
       select: {
         id: true,
         name: true,
@@ -53,7 +53,6 @@ export async function GET() {
         categories: {
           select: {
             name: true,
-            description: true,
           },
         },
       },
@@ -61,6 +60,14 @@ export async function GET() {
         name: "asc",
       },
     })
+    dbModules = rawModules.map((m) => ({
+      ...m,
+      categories: m.categories.map((c) => ({
+        name: c.name,
+        // Some deployments have Category.name but no Category.description column.
+        description: "",
+      })),
+    }))
   } catch (error) {
     dbError = error instanceof Error ? error.message : String(error)
     console.error("Error reading modules from database:", error)
