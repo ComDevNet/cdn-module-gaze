@@ -9,10 +9,20 @@ import {
  * `serverBackgroundSessions` keeps state on a `globalThis`-pinned slot
  * (so the monitor and the route handlers share one in-memory store).
  * Tests need to clear that slot between cases.
+ *
+ * NOTE: the module captures `state` by reference at load time, so simply
+ * reassigning `globalThis[KEY] = { rows: [] }` would only swap the global
+ * slot — the live module would still hold the old array. Mutate the
+ * array in place so the module sees an empty session list.
  */
 function clearBackgroundSessions(): void {
   const key = Symbol.for("cdnModuleGaze.backgroundSessions.state");
-  const g = globalThis as unknown as Record<symbol, unknown>;
+  const g = globalThis as unknown as Record<symbol, { rows: unknown[] }>;
+  const slot = g[key];
+  if (slot && Array.isArray(slot.rows)) {
+    slot.rows.length = 0;
+    return;
+  }
   g[key] = { rows: [] };
 }
 
