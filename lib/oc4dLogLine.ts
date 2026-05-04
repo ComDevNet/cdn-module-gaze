@@ -26,7 +26,6 @@ const USERNAME_KEYS = [
 function normalizeIdentityValue(raw: string | null | undefined): string {
   if (!raw) return "";
   let out = raw.trim();
-  out = out.replace(/^(?:user|username|login|email|sub)=/i, "");
   out = out.replace(/^["']|["']$/g, "");
   out = out.replace(/[;,]+$/g, "");
   if (!out || out === "-") return "";
@@ -89,6 +88,25 @@ function extractClientAddress(logLine: string): string | null {
   const token = m[1].replace(/^\[|\]$/g, "");
   const stripped = token.startsWith("::ffff:") ? token.slice(7) : token;
   return normalizeIdentityValue(stripped) || null;
+}
+
+/**
+ * IPv4 / IPv6 loopback addresses we want to drop from user analytics by
+ * default. Production users always come in over the LAN with a real
+ * 192.168.x.x / 10.x.x.x IP — loopback traffic is exclusively from local
+ * health checks, internal scrapers, or verification curls run on the Pi
+ * itself, and was previously polluting the live-sessions panel with rows
+ * like `teacher@example.com` and `testuser@example.com`.
+ */
+function isLoopbackAddress(ip: string): boolean {
+  if (ip === "127.0.0.1" || ip === "::1" || ip === "0.0.0.0") return true;
+  return ip.startsWith("127.");
+}
+
+/** Set `MODULEGAZE_INCLUDE_LOOPBACK=1` for local dev where you DO want to track 127.0.0.1 traffic. */
+function isLoopbackTrackingEnabled(): boolean {
+  const v = process.env.MODULEGAZE_INCLUDE_LOOPBACK?.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
 }
 
 /**
@@ -170,6 +188,7 @@ export function parseOc4dModuleAccessLine(
   if (!moduleInfo) return null;
   const ip = extractClientAddress(logLine);
   if (!ip) return null;
+  if (isLoopbackAddress(ip) && !isLoopbackTrackingEnabled()) return null;
 
   const moduleName = moduleInfo.moduleId;
   const username = extractUsernameFromLogLine(logLine);
@@ -189,6 +208,7 @@ export function parseOc4dModuleAssetHeartbeat(
   if (!moduleName) return null;
   const ip = extractClientAddress(logLine);
   if (!ip) return null;
+  if (isLoopbackAddress(ip) && !isLoopbackTrackingEnabled()) return null;
   const username = extractUsernameFromLogLine(logLine);
   return { ip, username, module: moduleName };
 }

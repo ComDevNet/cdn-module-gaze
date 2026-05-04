@@ -94,3 +94,39 @@ test("morgan `user=<email>` token also works for asset heartbeats", () => {
   assert.equal(heartbeat.username, "teacher@example.com");
   assert.equal(heartbeat.module, "cdn_math");
 });
+
+test("drops loopback (127.0.0.1) traffic by default — keeps test curls out of analytics", () => {
+  delete process.env.MODULEGAZE_INCLUDE_LOOPBACK;
+  const access =
+    'May 04 14:30:00 cdn oc4d[5471]: info: 127.0.0.1 user=teacher@example.com - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_math/content/index.html HTTP/1.1" 200';
+  assert.equal(parseOc4dModuleAccessLine(access), null);
+
+  const heartbeat =
+    'May 04 14:30:01 cdn oc4d[5471]: info: 127.0.0.1 user=teacher@example.com - [2026-05-04T14:30:01.000Z] "GET /modules/cdn_math/content/app.js HTTP/1.1" 200';
+  assert.equal(parseOc4dModuleAssetHeartbeat(heartbeat), null);
+});
+
+test("drops IPv6 loopback (::1) and ::ffff:127.0.0.1 too", () => {
+  delete process.env.MODULEGAZE_INCLUDE_LOOPBACK;
+  const v6 =
+    'May 04 14:30:00 cdn oc4d[5471]: info: ::1 user=robot@example.com - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_math/content/index.html HTTP/1.1" 200';
+  assert.equal(parseOc4dModuleAccessLine(v6), null);
+
+  const mapped =
+    'May 04 14:30:00 cdn oc4d[5471]: info: ::ffff:127.0.0.1 user=robot@example.com - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_math/content/index.html HTTP/1.1" 200';
+  assert.equal(parseOc4dModuleAccessLine(mapped), null);
+});
+
+test("MODULEGAZE_INCLUDE_LOOPBACK=1 enables loopback tracking for local dev", () => {
+  process.env.MODULEGAZE_INCLUDE_LOOPBACK = "1";
+  try {
+    const line =
+      'May 04 14:30:00 cdn oc4d[5471]: info: 127.0.0.1 user=devuser@example.com - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_math/content/index.html HTTP/1.1" 200';
+    const parsed = parseOc4dModuleAccessLine(line);
+    assert.ok(parsed);
+    assert.equal(parsed.ip, "127.0.0.1");
+    assert.equal(parsed.username, "devuser@example.com");
+  } finally {
+    delete process.env.MODULEGAZE_INCLUDE_LOOPBACK;
+  }
+});
