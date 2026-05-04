@@ -91,6 +91,26 @@ function extractClientAddress(logLine: string): string | null {
 }
 
 /**
+ * Match the `user=<value>` token oc4d emits between the IP and the timestamp
+ * (morgan format `:remote-addr user=:user - [:ts] ...`). Anchored to leading
+ * whitespace so URL query strings like `?user=foo` / `&user=foo` are NOT
+ * matched here — those are handled by the query-parameter scanner below.
+ */
+function extractUsernameFromAccessLogUserToken(
+  logLine: string
+): string | null {
+  const m = /\s+user=([^\s&"',;]+)/.exec(logLine);
+  if (!m?.[1]) return null;
+  let raw = m[1];
+  try {
+    raw = decodeURIComponent(raw.replace(/\+/g, " "));
+  } catch {
+    /* keep raw on decode failure */
+  }
+  return normalizeIdentityValue(raw) || null;
+}
+
+/**
  * Prefer identity from proxy headers / URL params when combined logs use `-`
  * for the Apache-style remote user field. Also reads identity from the
  * trailing JSON object oc4d emits on each access line.
@@ -98,6 +118,9 @@ function extractClientAddress(logLine: string): string | null {
 function extractUsernameFromLogLine(logLine: string): string {
   const fromJson = extractUsernameFromTrailingJson(logLine);
   if (fromJson) return fromJson;
+
+  const fromUserToken = extractUsernameFromAccessLogUserToken(logLine);
+  if (fromUserToken) return fromUserToken;
 
   const headerPatterns = [
     /\b(?:x-remote-user|x-auth-request-user|x-forwarded-user|x-authenticated-user|x-user-email|x-user|remote[_-]user)\s*[:=]\s*(?:"([^"]+)"|'([^']+)'|([^\s,;]+))/i,

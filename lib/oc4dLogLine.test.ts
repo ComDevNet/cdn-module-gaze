@@ -57,3 +57,40 @@ test("falls back to Guest when no identity is available", () => {
   assert.ok(parsed);
   assert.equal(parsed.username, "Guest");
 });
+
+test("parses identity from oc4d morgan `user=<email>` token", () => {
+  const line =
+    'May 04 14:30:00 cdn oc4d[5471]: info: 192.168.1.20 user=teacher@example.com - [2026-05-04T14:30:00.000Z] "GET /uploads/modules/1763389063089_v6sji3qt1/cdn_math/index.html HTTP/1.1" 200 1234 "-" "Mozilla/5.0" {"timestamp":"2026-05-04T14:30:00.000Z"}';
+  const parsed = parseOc4dModuleAccessLine(line);
+  assert.ok(parsed);
+  assert.equal(parsed.ip, "192.168.1.20");
+  assert.equal(parsed.username, "teacher@example.com");
+  assert.equal(parsed.module, "cdn_math");
+});
+
+test("morgan `user=anonymous` token resolves to Guest", () => {
+  const line =
+    'May 04 14:30:00 cdn oc4d[5471]: info: 192.168.1.20 user=anonymous - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_geo/content/index.html HTTP/1.1" 200 1234';
+  const parsed = parseOc4dModuleAccessLine(line);
+  assert.ok(parsed);
+  assert.equal(parsed.username, "Guest");
+});
+
+test("morgan `user=` token does not get confused with `?user=` query strings", () => {
+  // No leading whitespace before `user=` inside the URL → must not match the
+  // morgan-token rule. Should fall through to the query-string scanner.
+  const line =
+    'May 04 14:30:00 cdn oc4d[5471]: info: 192.168.1.20 - [2026-05-04T14:30:00.000Z] "GET /modules/cdn_x/content/index.html?user=urlpicked@example.com HTTP/1.1" 200';
+  const parsed = parseOc4dModuleAccessLine(line);
+  assert.ok(parsed);
+  assert.equal(parsed.username, "urlpicked@example.com");
+});
+
+test("morgan `user=<email>` token also works for asset heartbeats", () => {
+  const line =
+    'May 04 14:30:01 cdn oc4d[5471]: info: 192.168.1.20 user=teacher@example.com - [2026-05-04T14:30:01.000Z] "GET /uploads/modules/1763389063089_v6sji3qt1/cdn_math/assets/app.js HTTP/1.1" 200 5678';
+  const heartbeat = parseOc4dModuleAssetHeartbeat(line);
+  assert.ok(heartbeat);
+  assert.equal(heartbeat.username, "teacher@example.com");
+  assert.equal(heartbeat.module, "cdn_math");
+});
