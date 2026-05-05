@@ -43,20 +43,43 @@ export function extractModuleIdFromPath(pathOrUrl: string): string | null {
 const DYNAMIC_MODULE_SEGMENT = /^\d{10,}_[a-zA-Z0-9_-]+$/;
 
 /**
- * From ordered path segments (GET then Referer, etc.), prefer a stable slug
- * over a numeric_instance id so DB `indexHtmlUrl` matching works.
+ * From ordered path segments under `/modules/...` or `/uploads/modules/...`,
+ * pick the slug. The convention is `/modules/<build>/<slug>/...` (with
+ * `<build>` matching `DYNAMIC_MODULE_SEGMENT`) or `/modules/<slug>/...` for
+ * legacy paths. The slug is the FIRST stable segment — anything after it is
+ * sub-page or asset structure (e.g. `<slug>/img/foo.jpg`,
+ * `<slug>/asset/index.html`) and must not be misattributed as a module id.
+ *
+ * The previous implementation returned `stable[stable.length - 1]`, which
+ * caused real production logs to persist phantom modules named `img`,
+ * `asset`, `asse`, `style`, etc. — every time a module had a sub-folder
+ * whose name happened not to be in the asset-folder break list. Picking the
+ * FIRST stable segment is correct under both URL conventions and immune
+ * to whatever directory naming a module ships with on disk.
  */
 export function preferStableModuleSegment(candidates: string[]): string | null {
   if (candidates.length === 0) return null;
   const stable = candidates.filter((s) => !DYNAMIC_MODULE_SEGMENT.test(s));
-  if (stable.length > 0) return stable[stable.length - 1];
+  if (stable.length > 0) return stable[0];
   return candidates[0];
 }
 
 /**
- * Path segments under `/uploads/modules/...` or `/modules/...` until a static
- * folder or file (e.g. `/uploads/modules/<build>/cdn_verbs/index.html` →
- * `["<build>", "cdn_verbs"]`).
+ * Up to the first two path segments under `/uploads/modules/...` or
+ * `/modules/...`. That's exactly how many we need to identify the module:
+ *
+ *   /uploads/modules/<build>/<slug>/...   → ["<build>", "<slug>"]
+ *   /modules/<build>/<slug>/...           → ["<build>", "<slug>"]
+ *   /modules/<slug>/...                   → ["<slug>"] (or ["<slug>", "<sub>"])
+ *
+ * Anything beyond the slug is either sub-page navigation (e.g.
+ * `<slug>/img/index.html`) or asset folder structure (e.g.
+ * `<slug>/asset/web/foo.css`, `<slug>/img/big-book.jpg`). Including those
+ * downstream segments was the root cause of phantom moduleIds like
+ * `asset`, `asse`, `img`, `style`, etc., showing up in
+ * `modulegaze-sessions.log`. Keeping the candidate list trimmed to two
+ * makes `preferStableModuleSegment` robust regardless of how a module
+ * organises its files on disk.
  */
 function moduleSegmentsFromPathname(pathname: string): string[] {
   const uploads = pathname.match(/\/uploads\/modules\/(.+)/i);
@@ -65,16 +88,12 @@ function moduleSegmentsFromPathname(pathname: string): string[] {
   if (!tail) return [];
   const parts = tail.split("/").filter(Boolean);
   const out: string[] = [];
-  for (const seg of parts) {
-    const lower = seg.toLowerCase();
-    if (
-      ["content", "node", "static", "assets", "dist", "build", "public"].includes(
-        lower
-      )
-    ) {
-      break;
-    }
+  for (const seg of parts.slice(0, 2)) {
     if (/\.[a-z0-9]{1,10}$/i.test(seg)) {
+      // Reached a leaf file (e.g. `/modules/<slug>/index.html` where slug
+      // is the first segment) — stop and let the caller pick from what we
+      // have. Without this we would push `index.html` and then a stable
+      // filter could return it as the moduleId.
       break;
     }
     out.push(decodePathSafe(seg));
