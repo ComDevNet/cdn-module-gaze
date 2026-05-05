@@ -416,35 +416,43 @@ export default function CDNModuleMonitor() {
     });
   }, []);
 
-  // Update session durations every second so "Time spent" is a live
-  // counter even between server polls (background-monitor mode polls the
-  // snapshot at 1.5s and the server-side `duration` is anchored to
-  // `lastActivityMs`, which only advances when a heartbeat arrives every
-  // 30s — without local interpolation the cell sits on 0s for the whole
-  // first 30s of a visit).
+  // Compute the displayed duration for a session.
+  //
+  // Both the polling effect and the 1-second ticker call this so the
+  // value the user sees is consistent. The server-side `duration` field
+  // is anchored to `lastActivityMs - startTimeMs` and only advances
+  // every 30s when a heartbeat arrives — if the polling effect were to
+  // overwrite the row with `s.duration`, the "Time spent" cell would
+  // oscillate between the live tick and the (stale) server value as
+  // polls and ticks raced.
   //
   // Freshness gate: if the last evidence of activity is older than
-  // `SESSION_INACTIVITY_MS / 2`, the user is probably gone and we should
-  // freeze on `lastActivity - startTime` rather than ticking up forever.
+  // `SESSION_INACTIVITY_MS / 2`, the user is probably gone and we
+  // freeze on `lastActivity - startTime` rather than ticking up
+  // forever.
+  const FRESH_WINDOW_MS = Math.max(SESSION_INACTIVITY_MS / 2, 60_000);
+  const computeDisplayDuration = useCallback(
+    (startTime: Date, lastActivity: Date): number => {
+      const now = Date.now();
+      const lastActivityMs = lastActivity.getTime();
+      const startTimeMs = startTime.getTime();
+      const fresh = now - lastActivityMs <= FRESH_WINDOW_MS;
+      return fresh
+        ? Math.max(0, Math.floor((now - startTimeMs) / 1000))
+        : Math.max(0, Math.floor((lastActivityMs - startTimeMs) / 1000));
+    },
+    [FRESH_WINDOW_MS]
+  );
+
   useEffect(() => {
-    const FRESH_WINDOW_MS = Math.max(SESSION_INACTIVITY_MS / 2, 60_000);
     const interval = setInterval(() => {
       setUserSessions((prev) => {
         let changed = false;
         const next = prev.map((session) => {
-          const now = Date.now();
-          const lastActivityMs = session.lastActivity.getTime();
-          const startTimeMs = session.startTime.getTime();
-          const fresh = now - lastActivityMs <= FRESH_WINDOW_MS;
-          const computed = fresh
-            ? Math.max(
-                0,
-                Math.floor((now - startTimeMs) / 1000)
-              )
-            : Math.max(
-                0,
-                Math.floor((lastActivityMs - startTimeMs) / 1000)
-              );
+          const computed = computeDisplayDuration(
+            session.startTime,
+            session.lastActivity
+          );
           if (computed === session.duration) return session;
           changed = true;
           return { ...session, duration: computed };
@@ -458,7 +466,11 @@ export default function CDNModuleMonitor() {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [cleanupInactiveSessions, stats.backgroundModuleMonitor]);
+  }, [
+    cleanupInactiveSessions,
+    computeDisplayDuration,
+    stats.backgroundModuleMonitor,
+  ]);
 
   // Check timer violations periodically
   useEffect(() => {
@@ -640,16 +652,26 @@ export default function CDNModuleMonitor() {
         };
         if (cancelled) return;
         const list = data.sessions ?? [];
+        // Compute duration locally (don't trust `s.duration` from the
+        // server) so the polled snapshot matches what the once-a-second
+        // ticker would render. Otherwise the cell oscillates between
+        // the live tick (now - startTime) and the stale server value
+        // (lastActivity - startTime, only advances every 30s) as the
+        // poll and tick race each other.
         setUserSessions(
-          list.map((s) => ({
-            ip: s.ip,
-            username: s.username,
-            displayName: s.displayName,
-            module: s.module,
-            startTime: new Date(s.startTime),
-            lastActivity: new Date(s.lastActivity),
-            duration: s.duration,
-          }))
+          list.map((s) => {
+            const startTime = new Date(s.startTime);
+            const lastActivity = new Date(s.lastActivity);
+            return {
+              ip: s.ip,
+              username: s.username,
+              displayName: s.displayName,
+              module: s.module,
+              startTime,
+              lastActivity,
+              duration: computeDisplayDuration(startTime, lastActivity),
+            };
+          })
         );
       } catch {
         /* ignore */
@@ -661,7 +683,11 @@ export default function CDNModuleMonitor() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [stats.backgroundModuleMonitor, backgroundViewPaused]);
+  }, [
+    stats.backgroundModuleMonitor,
+    backgroundViewPaused,
+    computeDisplayDuration,
+  ]);
 
   // Format duration for display
   const formatDuration = (seconds: number) => {
