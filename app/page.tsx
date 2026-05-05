@@ -327,23 +327,8 @@ export default function CDNModuleMonitor() {
             s.username === username &&
             s.module === moduleSlug
         );
+        if (idx < 0) return prev;
         const now = new Date();
-        if (idx < 0) {
-          // If monitoring starts after user already entered a module, an asset
-          // heartbeat may be the first signal we see. Create a session so the
-          // table is not empty until next index.html navigation.
-          return [
-            ...prev,
-            {
-              ip,
-              username,
-              module: moduleSlug,
-              startTime: now,
-              duration: 0,
-              lastActivity: now,
-            },
-          ];
-        }
         const next = [...prev];
         next[idx] = { ...next[idx], lastActivity: now };
         return next;
@@ -431,22 +416,46 @@ export default function CDNModuleMonitor() {
     });
   }, []);
 
-  // Update session durations (browser stream only; background uses server snapshot)
+  // Update session durations every second so "Time spent" is a live
+  // counter even between server polls (background-monitor mode polls the
+  // snapshot at 1.5s and the server-side `duration` is anchored to
+  // `lastActivityMs`, which only advances when a heartbeat arrives every
+  // 30s — without local interpolation the cell sits on 0s for the whole
+  // first 30s of a visit).
+  //
+  // Freshness gate: if the last evidence of activity is older than
+  // `SESSION_INACTIVITY_MS / 2`, the user is probably gone and we should
+  // freeze on `lastActivity - startTime` rather than ticking up forever.
   useEffect(() => {
-    if (stats.backgroundModuleMonitor) return;
+    const FRESH_WINDOW_MS = Math.max(SESSION_INACTIVITY_MS / 2, 60_000);
     const interval = setInterval(() => {
-      setUserSessions((prev) =>
-        prev.map((session) => ({
-          ...session,
-          duration: Math.floor(
-            (Date.now() - session.startTime.getTime()) / 1000
-          ), // seconds instead of minutes
-        }))
-      );
+      setUserSessions((prev) => {
+        let changed = false;
+        const next = prev.map((session) => {
+          const now = Date.now();
+          const lastActivityMs = session.lastActivity.getTime();
+          const startTimeMs = session.startTime.getTime();
+          const fresh = now - lastActivityMs <= FRESH_WINDOW_MS;
+          const computed = fresh
+            ? Math.max(
+                0,
+                Math.floor((now - startTimeMs) / 1000)
+              )
+            : Math.max(
+                0,
+                Math.floor((lastActivityMs - startTimeMs) / 1000)
+              );
+          if (computed === session.duration) return session;
+          changed = true;
+          return { ...session, duration: computed };
+        });
+        return changed ? next : prev;
+      });
 
-      // Clean up inactive sessions
-      cleanupInactiveSessions();
-    }, 1000); // Update every second
+      if (!stats.backgroundModuleMonitor) {
+        cleanupInactiveSessions();
+      }
+    }, 1000);
 
     return () => clearInterval(interval);
   }, [cleanupInactiveSessions, stats.backgroundModuleMonitor]);
