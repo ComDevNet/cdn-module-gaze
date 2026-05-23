@@ -17,6 +17,7 @@ CDN Module Gaze monitors your existing `oc4d.service` logs in real-time to track
 - ⏱️ **Time Tracking**: Tracks how long each IP spends on each module (live seconds counter)
 - 🚨 **Time Limits & Alerts**: Set time limits for specific modules with visual and alert notifications
 - 🎯 **Smart Module Matching**: Links log module names to database module names using URL patterns
+- 🧾 **Plain Log Files + Daily Zip Archives**: Writes human-readable `.log` files and zips prior days automatically
 - 📱 **Responsive Design**: Works on desktop and mobile devices
 - 🌙 **Modern UI**: Clean, professional interface with real-time updates
 
@@ -73,7 +74,7 @@ Match: ✅ URL ID === Module ID
 **Session Management:**
 
 - One active session per IP address
-- Sessions timeout after 100 minutes of inactivity
+- Sessions timeout after 5 minutes of inactivity
 - Time tracking starts when module access is detected
 - Live counter updates every second
 
@@ -117,6 +118,61 @@ When a user exceeds a time limit:
 - Alert notification appears at top
 - Console logs violation details
 - Session continues tracking (doesn't stop)
+
+### 5. Log Files and Daily Archives
+
+By default, Module Gaze writes logs under `/var/log/modulegaze` (override with `MODULEFETCH_LOG_DIR`):
+
+- `modulegaze-access.log` (live day file; only when `MODULEGAZE_TEE_ACCESS_LOG=1`)
+- `modulegaze-sessions.log` (live day file; session duration records)
+- At the first write of a new day, yesterday's `.log` file is automatically zipped to:
+  - `modulegaze-access-YYYY-MM-DD.log.zip`
+  - `modulegaze-sessions-YYYY-MM-DD.log.zip`
+
+Session lines are plain text (`tab` separated), for example:
+
+```bash
+2026-05-04T12:00:00.000Z	userId=teacher@example.com|192.168.1.20	moduleId=cdn_math	durationSeconds=305	schemaVersion=1
+```
+
+### 6. Recommended service env
+
+Set these in `cdnmodulegaze.service` for production monitoring:
+
+```bash
+MODULEGAZE_BACKGROUND_MONITOR=1
+MODULEGAZE_TEE_ACCESS_LOG=1
+MODULEGAZE_JOURNAL_SINCE=today
+MODULEFETCH_LOG_DIR=/var/log/modulegaze
+MODULEGAZE_UPLOADS_MODULES_ROOT=/oc4d-server/workspaces/website/uploads/modules
+```
+
+### 7. Raspberry Pi verification checklist
+
+Run these checks on the Pi after deploy:
+
+```bash
+# 1) Reload service and restart
+sudo systemctl daemon-reload
+sudo systemctl restart cdnmodulegaze
+sudo systemctl status cdnmodulegaze --no-pager
+
+# 2) Confirm module API returns catalog + diagnostics
+curl -s http://127.0.0.1:3002/api/modules
+
+# 3) Confirm background monitor/log env values are active
+sudo systemctl show cdnmodulegaze -p Environment
+
+# 4) Watch live logs and verify identities are no longer Guest by default
+sudo journalctl -u cdnmodulegaze -f
+
+# 5) Verify plain logs are being written
+sudo ls -lah /var/log/modulegaze
+sudo tail -n 20 /var/log/modulegaze/modulegaze-access.log
+sudo tail -n 20 /var/log/modulegaze/modulegaze-sessions.log
+```
+
+To validate daily zip rotation without waiting for midnight, stop the service, set one log file mtime to yesterday, then start service and trigger one new write; the previous-day file should be zipped automatically.
 
 ## Installation
 

@@ -25,40 +25,30 @@ model Report {
 }
 
 model Module {
-  // Database columns
-  id             String           @id @default(uuid())
-  name           String           @unique
-  description    String
-  indexHtmlUrl   String           @map("index_html_url")
-  logoUrl        String           @map("logo_url")
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
-  language       String
-  enabled        Boolean          @default(true)
-  categories     Category[]
-  ModuleCategory ModuleCategory[]
+  // Mirrors the `Module` table in the oc4d-server Postgres DB.
+  id           String     @id @default(uuid())
+  name         String     @unique
+  description  String
+  indexHtmlUrl String     @map("index_html_url")
+  logoUrl      String     @map("logo_url")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  language     String
+  enabled      Boolean    @default(true)
+  open         Boolean    @default(true)
+  categories   Category[]
 }
 
 model Category {
-  // Database columns
-  id             String           @id @default(uuid())
-  name           String           @unique
-  description    String
-  logoUrl        String           @map("logo_url")
-  enabled        Boolean          @default(true)
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
-  modules        Module[]
-  ModuleCategory ModuleCategory[]
-}
-
-model ModuleCategory {
-  moduleName   String   @map("module_name")  // Foreign key to Module
-  categoryName String   @map("category_name") // Foreign key to Category based on the unique name field
-  module       Module   @relation(fields: [moduleName], references: [name])
-  category     Category @relation(fields: [categoryName], references: [name])
-
-  @@id([moduleName, categoryName])
+  // Mirrors the `Category` table in the oc4d-server Postgres DB.
+  // NOTE: oc4d-server's Category has no `description` column — do not add one here.
+  id        String   @id @default(uuid())
+  name      String   @unique
+  logoUrl   String   @map("logo_url")
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  modules   Module[]
 }
 
 model TrainingVideos {
@@ -71,4 +61,15 @@ model TrainingVideos {
   updatedAt   DateTime @updatedAt @map("updated_at")
   language    String
   instructors String[]
+}
+
+/// Application users (Prisma Studio: id, name, email).
+/// Log identity is matched to `email` (case-insensitive); UI shows `name` only.
+/// In oc4d-server's DB the column is `full_name`; we expose it as `name` in code.
+model User {
+  id    String @id
+  name  String @map("full_name")
+  email String @unique
+
+  @@map("User")
 }

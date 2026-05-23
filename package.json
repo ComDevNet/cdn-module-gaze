@@ -4,13 +4,14 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "bun x prisma generate && next build",
+    "build": "prisma generate && next build",
     "start": "next start -p 3002",
     "lint": "next lint"
   },
   "dependencies": {
     "@prisma/client": "^6.11.1",
     "@radix-ui/react-slot": "^1.2.3",
+    "archiver": "^7.0.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "critters": "^0.0.25",
@@ -22,9 +23,13 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/archiver": "^7.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "eslint": "8.57.0",
+    "eslint-config-next": "15.3.5",
+    "prisma": "6.11.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"

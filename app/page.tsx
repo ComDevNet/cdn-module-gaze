@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,9 +16,23 @@ import {
   ChevronDown,
   Check,
 } from "lucide-react";
+import { extractModuleIdFromPath } from "@/lib/modulePath";
+import { SESSION_INACTIVITY_MS } from "@/lib/sessionConstants";
+import { resolveDisplayNameFromMap } from "@/lib/userPoolKey";
+import {
+  parseOc4dModuleAccessLine,
+  parseOc4dModuleAssetHeartbeat,
+} from "@/lib/oc4dLogLine";
+import {
+  postModulefetchIngest,
+  sessionToModulefetchUserId,
+} from "@/lib/postModulefetchIngest";
 
 interface UserSession {
   ip: string;
+  username: string;
+  /** Cached `User.name` from server when `User.email` matches log identity. */
+  displayName?: string;
   module: string;
   startTime: Date;
   duration: number;
@@ -27,6 +41,7 @@ interface UserSession {
 
 interface ModuleTimer {
   moduleName: string;
+  moduleSlug: string;
   timeLimit: number; // in minutes
   isActive: boolean;
 }
@@ -36,6 +51,10 @@ interface Stats {
   totalCategories: number;
   uniqueUsersToday: number;
   activeSessions: number;
+  /** From server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (periodic session-log flush while monitoring). */
+  modulefetchPeriodicFlushMinutes?: number;
+  /** Server-side journalctl + sessions (MODULEGAZE_BACKGROUND_MONITOR). */
+  backgroundModuleMonitor?: boolean;
 }
 
 interface Module {
@@ -45,13 +64,32 @@ interface Module {
   language: string;
   indexHtmlUrl: string;
   logoUrl: string;
-  categories: { name: string; description: string }[];
+  categories: { name: string }[];
+}
+
+interface ModulesApiPayload {
+  modules?: Module[];
+  sources?: {
+    mergedCount?: number;
+    database?: {
+      ok?: boolean;
+      count?: number;
+      error?: string | null;
+    };
+    scan?: {
+      enabled?: boolean;
+      root?: string | null;
+      rootsTried?: string[];
+      count?: number;
+    };
+  };
+  warnings?: string[];
 }
 
 export default function CDNModuleMonitor() {
   const [userSessions, setUserSessions] = useState<UserSession[]>([]);
   const [moduleTimers, setModuleTimers] = useState<ModuleTimer[]>([
-    { moduleName: "default", timeLimit: 1, isActive: false },
+    { moduleName: "default", moduleSlug: "default", timeLimit: 1, isActive: false },
   ]);
   const [stats, setStats] = useState<Stats>({
     totalModules: 0,
@@ -62,100 +100,149 @@ export default function CDNModuleMonitor() {
   const [alerts, setAlerts] = useState<string[]>([]);
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [selectedModule, setSelectedModule] = useState("");
+  const [selectedModuleSlug, setSelectedModuleSlug] = useState("");
   const [timerMinutes, setTimerMinutes] = useState("");
   const [modules, setModules] = useState<Module[]>([]);
+  /** Normalized login_key → display_name from GET /api/user-pool */
+  const [userPoolMap, setUserPoolMap] = useState<Record<string, string>>({});
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [modulesLoadError, setModulesLoadError] = useState<string | null>(null);
+  const [modulesLoadInfo, setModulesLoadInfo] = useState<string | null>(null);
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  /** Server hint when live journalctl is unavailable (e.g. Windows). */
+  const [logSourceInfo, setLogSourceInfo] = useState<{ reason: string } | null>(
+    null
+  );
+  /** Pause polling server sessions (background mode only). */
+  const [backgroundViewPaused, setBackgroundViewPaused] = useState(false);
+  const statsRef = useRef(stats);
+  statsRef.current = stats;
   const eventSourceRef = useRef<EventSource | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const userSessionsRef = useRef<UserSession[]>([]);
 
-  // Extract module identifier from indexHtmlUrl (second section after /modules/)
-  const extractModuleIdFromUrl = (indexHtmlUrl: string): string | null => {
-    try {
-      // Handle URLs like "/modules/cdn_acid_bases_and_salts/content/index.html"
-      // or "http://example.com/modules/cdn_acid_bases_and_salts/index.html"
-      const match = indexHtmlUrl.match(/\/modules\/([^/]+)/);
-      return match ? match[1] : null;
-    } catch (error) {
-      console.error(
-        "Error extracting module ID from URL:",
-        indexHtmlUrl,
-        error
+  useEffect(() => {
+    userSessionsRef.current = userSessions;
+  }, [userSessions]);
+
+  const labelForSessionUser = useCallback(
+    (session: UserSession) => {
+      if (session.username === "Guest") return "Guest";
+      if (session.displayName && session.displayName.length > 0) {
+        return session.displayName;
+      }
+      return resolveDisplayNameFromMap(userPoolMap, session.username);
+    },
+    [userPoolMap]
+  );
+
+  const normalizeModuleKey = useCallback((value: string) => {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[_\s]+/g, "-")
+      .replace(/[^a-z0-9-]/g, "");
+  }, []);
+
+  const getModuleSlug = useCallback(
+    (module: Module): string => extractModuleIdFromPath(module.indexHtmlUrl) ?? module.name,
+    []
+  );
+
+  // Find matching module from database based on log module name (slug or URL segment)
+  const findMatchingModule = useCallback((logModuleName: string): Module | null => {
+    const normalizedLogKey = normalizeModuleKey(logModuleName);
+    if (!normalizedLogKey) return null;
+
+    const byExactSlug = modules.find(
+      (module) => normalizeModuleKey(getModuleSlug(module)) === normalizedLogKey
+    );
+    if (byExactSlug) return byExactSlug;
+
+    const byPathContains = modules.find(
+      (m) =>
+        m.indexHtmlUrl.includes(`/modules/${logModuleName}/`) ||
+        (m.indexHtmlUrl.includes("/uploads/modules/") &&
+          m.indexHtmlUrl.includes(`/${logModuleName}/`))
+    );
+    if (byPathContains) return byPathContains;
+
+    const slugPrefixMatches = modules.filter((module) => {
+      const slugKey = normalizeModuleKey(getModuleSlug(module));
+      return (
+        slugKey.startsWith(`${normalizedLogKey}-`) ||
+        normalizedLogKey.startsWith(`${slugKey}-`)
       );
-      return null;
-    }
-  };
-
-  // Find matching module from database based on log module name
-  const findMatchingModule = (logModuleName: string): Module | null => {
-    // Direct match with the second section of indexHtmlUrl
-    const match = modules.find((module) => {
-      const moduleId = extractModuleIdFromUrl(module.indexHtmlUrl);
-      return moduleId === logModuleName;
     });
+    if (slugPrefixMatches.length === 1) return slugPrefixMatches[0];
 
-    return match || null;
-  };
+    return null;
+  }, [modules, getModuleSlug, normalizeModuleKey]);
 
   // Get display name for a module (from DB if matched, otherwise use log name)
-  const getDisplayName = (logModuleName: string): string => {
-    const matchedModule = findMatchingModule(logModuleName);
-    return matchedModule ? matchedModule.name : logModuleName;
-  };
+  const getDisplayName = useCallback(
+    (logModuleName: string): string => {
+      const matchedModule = findMatchingModule(logModuleName);
+      return matchedModule ? matchedModule.name : logModuleName;
+    },
+    [findMatchingModule]
+  );
 
   // Enhanced timer finding with detailed debugging
-  const findTimerForSession = (session: UserSession): ModuleTimer | null => {
+  const findTimerForSession = useCallback((session: UserSession): ModuleTimer | null => {
     const logModuleName = session.module;
     const matchedModule = findMatchingModule(logModuleName);
+    const normalizedLogModule = normalizeModuleKey(logModuleName);
 
     // Debug logging
     const debugMsg = `🔍 Finding timer for session: ${logModuleName}`;
     console.log(debugMsg);
 
-    // Try 1: Direct match with log module name
+    // Try 1: Direct slug/name match against stored timer
     let timer = moduleTimers.find(
-      (t) => t.moduleName === logModuleName && t.isActive
+      (t) =>
+        t.isActive &&
+        (normalizeModuleKey(t.moduleSlug) === normalizedLogModule ||
+          normalizeModuleKey(t.moduleName) === normalizedLogModule)
     );
     if (timer) {
       console.log(
-        `✅ Found timer via direct log match: ${timer.moduleName} (${timer.timeLimit}m)`
+        `✅ Found timer via direct slug/name match: ${timer.moduleName} (${timer.timeLimit}m)`
       );
       return timer;
     }
 
-    // Try 2: Match with database module name
+    // Try 2: Match with resolved module (title + slug)
     if (matchedModule) {
+      const matchedSlug = normalizeModuleKey(getModuleSlug(matchedModule));
       timer = moduleTimers.find(
-        (t) => t.moduleName === matchedModule.name && t.isActive
+        (t) =>
+          t.isActive &&
+          (normalizeModuleKey(t.moduleName) === normalizeModuleKey(matchedModule.name) ||
+            normalizeModuleKey(t.moduleSlug) === matchedSlug)
       );
       if (timer) {
         console.log(
-          `✅ Found timer via DB module match: ${timer.moduleName} (${timer.timeLimit}m)`
+          `✅ Found timer via resolved module match: ${timer.moduleName} (${timer.timeLimit}m)`
         );
         return timer;
       }
     }
 
-    // Try 3: Check if any timer's module name matches the URL ID of our log module
-    const logModuleUrlId = logModuleName; // The log module name IS the URL ID
-    timer = moduleTimers.find((t) => {
+    // Try 3: Prefix fallback (e.g. "en" vs "en-educate")
+    const fuzzyCandidates = moduleTimers.filter((t) => {
       if (!t.isActive) return false;
-
-      // Find the module in DB that has this timer name
-      const timerModule = modules.find((m) => m.name === t.moduleName);
-      if (timerModule) {
-        const timerModuleUrlId = extractModuleIdFromUrl(
-          timerModule.indexHtmlUrl
-        );
-        return timerModuleUrlId === logModuleUrlId;
-      }
-      return false;
+      const key = normalizeModuleKey(t.moduleSlug || t.moduleName);
+      return (
+        key.startsWith(`${normalizedLogModule}-`) ||
+        normalizedLogModule.startsWith(`${key}-`)
+      );
     });
-
-    if (timer) {
+    if (fuzzyCandidates.length === 1) {
+      timer = fuzzyCandidates[0];
       console.log(
-        `✅ Found timer via reverse URL match: ${timer.moduleName} (${timer.timeLimit}m)`
+        `✅ Found timer via fuzzy slug match: ${timer.moduleName} (${timer.timeLimit}m)`
       );
       return timer;
     }
@@ -163,122 +250,121 @@ export default function CDNModuleMonitor() {
     console.log(`❌ No timer found for: ${logModuleName}`);
     console.log(
       `Available active timers:`,
-      moduleTimers.filter((t) => t.isActive).map((t) => t.moduleName)
+      moduleTimers
+        .filter((t) => t.isActive)
+        .map((t) => `${t.moduleName}[${t.moduleSlug}]`)
     );
 
     return null;
-  };
+  }, [moduleTimers, findMatchingModule, getModuleSlug, normalizeModuleKey]);
 
-  // Extract module name from URL path - updated for your log format
-  const extractModuleName = (url: string): string | null => {
-    // Handle URLs like "/modules/en-schools/content/node/typing_etc_streams_tfr2.html"
-    const match = url.match(/\/modules\/([^/]+)/);
-    if (match) {
-      return match[1]; // Returns "en-schools" from the example
-    }
-
-    // Also handle direct module references
-    const directMatch = url.match(/\/modules\/([^/?]+)/);
-    return directMatch ? directMatch[1] : null;
-  };
-
-  // Parse log entry - updated for your specific log format
-  const parseLogEntry = (logLine: string) => {
-    try {
-      // Your log format: Jul 02 03:13:12 cdn oc4d[2369]: info: ::ffff:192.168.4.238 - [2024-07-02T03:13:12.202Z] "GET /modules/en-schools/content/node/typing_etc_streams_tfr2.html HTTP/1.1" 200 - "http://oc4d.cdn/modules/en-schools/content/index.html" "Mozilla/5.0..."
-
-      // Extract IP address - look for IPv4 pattern after "info:"
-      const ipMatch = logLine.match(/info:\s*(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)/);
-
-      // Extract URL from the GET request
-      const urlMatch = logLine.match(/"GET\s+([^\s"]+)/);
-
-      if (ipMatch && urlMatch) {
-        const ip = ipMatch[1];
-        const url = urlMatch[1];
-        const moduleName = extractModuleName(url);
-
-        if (moduleName) {
-          console.log(`📋 Parsed: IP=${ip}, Module=${moduleName}, URL=${url}`);
-          return { ip, module: moduleName };
-        }
-      }
-    } catch (error) {
-      console.error("Error parsing log line:", error);
-    }
-    return null;
-  };
-
-  // Update user session
-  const updateUserSession = (ip: string, module: string) => {
+  // Update user session (one row per IP + username from oc4d remote-user field)
+  const updateUserSession = useCallback((ip: string, username: string, module: string) => {
     setUserSessions((prev) => {
-      const existingIndex = prev.findIndex((session) => session.ip === ip);
+      const existingIndex = prev.findIndex(
+        (session) => session.ip === ip && session.username === username
+      );
       const now = new Date();
 
       if (existingIndex >= 0) {
-        // Update existing session for this IP
         const updated = [...prev];
         const existing = updated[existingIndex];
 
         if (existing.module !== module) {
-          // User switched to a different module - reset timer
+          // Persist the previous module before switching, so history includes
+          // every module a user opened (not only their current module).
+          const endedAt = now.getTime();
+          const durationSeconds = Math.max(
+            0,
+            Math.floor((endedAt - existing.startTime.getTime()) / 1000)
+          );
+          queueMicrotask(() => {
+            void postModulefetchIngest({
+              userId: sessionToModulefetchUserId(existing),
+              moduleId: existing.module,
+              durationSeconds,
+              recordedAt: new Date(endedAt).toISOString(),
+            });
+          });
           updated[existingIndex] = {
             ip,
+            username,
             module,
             startTime: now,
             duration: 0,
             lastActivity: now,
           };
         } else {
-          // Same module, just update last activity (keep existing timer)
           updated[existingIndex] = {
             ...existing,
             lastActivity: now,
           };
         }
         return updated;
-      } else {
-        // New IP - create new session
-        return [
-          ...prev,
-          {
-            ip,
-            module,
-            startTime: now,
-            duration: 0,
-            lastActivity: now,
-          },
-        ];
       }
+
+      return [
+        ...prev,
+        {
+          ip,
+          username,
+          module,
+          startTime: now,
+          duration: 0,
+          lastActivity: now,
+        },
+      ];
     });
-  };
+  }, []);
+
+  /** Extends session lifetime on chunk/css GETs while the user stays in the same module. */
+  const touchUserSessionActivity = useCallback(
+    (ip: string, username: string, moduleSlug: string) => {
+      setUserSessions((prev) => {
+        const idx = prev.findIndex(
+          (s) =>
+            s.ip === ip &&
+            s.username === username &&
+            s.module === moduleSlug
+        );
+        if (idx < 0) return prev;
+        const now = new Date();
+        const next = [...prev];
+        next[idx] = { ...next[idx], lastActivity: now };
+        return next;
+      });
+    },
+    []
+  );
 
   const addModuleTimer = () => {
-    if (selectedModule && timerMinutes) {
+    if (selectedModule && selectedModuleSlug && timerMinutes) {
       const timer: ModuleTimer = {
         moduleName: selectedModule,
+        moduleSlug: selectedModuleSlug,
         timeLimit: Number.parseInt(timerMinutes),
         isActive: true,
       };
       setModuleTimers((prev) => {
-        // Remove existing timer for this module if it exists
-        const filtered = prev.filter((t) => t.moduleName !== selectedModule);
+        // Remove existing timer for this module slug if it exists
+        const filtered = prev.filter((t) => t.moduleSlug !== selectedModuleSlug);
         const newTimers = [...filtered, timer];
 
         // Debug log
         console.log(
-          `🎯 Added/Updated timer: ${selectedModule} -> ${timerMinutes}m`
+          `🎯 Added/Updated timer: ${selectedModule} [${selectedModuleSlug}] -> ${timerMinutes}m`
         );
         console.log(
           `Active timers:`,
           newTimers
             .filter((t) => t.isActive)
-            .map((t) => `${t.moduleName}(${t.timeLimit}m)`)
+            .map((t) => `${t.moduleName}[${t.moduleSlug}](${t.timeLimit}m)`)
         );
 
         return newTimers;
       });
       setSelectedModule("");
+      setSelectedModuleSlug("");
       setTimerMinutes("");
       setSearchTerm("");
       setIsDropdownOpen(false);
@@ -286,13 +372,17 @@ export default function CDNModuleMonitor() {
   };
 
   // Check for timer violations with enhanced debugging
-  const checkTimerViolations = () => {
+  const checkTimerViolations = useCallback(() => {
     userSessions.forEach((session) => {
       const timer = findTimerForSession(session);
 
       if (timer && session.duration > timer.timeLimit * 60) {
         const displayName = getDisplayName(session.module);
-        const alertMessage = `⚠️ IP ${session.ip} has exceeded ${timer.timeLimit} minutes on module "${displayName}"`;
+        const who =
+          session.username === "Guest"
+            ? `Guest (${session.ip})`
+            : `${labelForSessionUser(session)} (${session.ip})`;
+        const alertMessage = `⚠️ ${who} has exceeded ${timer.timeLimit} minutes on module "${displayName}"`;
         console.log(`🚨 TIMER VIOLATION: ${alertMessage}`);
 
         setAlerts((prev) => {
@@ -303,75 +393,301 @@ export default function CDNModuleMonitor() {
         });
       }
     });
-  };
+  }, [userSessions, findTimerForSession, getDisplayName, labelForSessionUser]);
 
-  // Change the cleanup function to keep sessions longer
-  // Clean up inactive sessions (no activity for 10 minutes instead of 2)
-  const cleanupInactiveSessions = () => {
-    const tenMinutesAgo = new Date(Date.now() - 1000 * 60 * 1000);
-    setUserSessions((prev) =>
-      prev.filter((session) => session.lastActivity > tenMinutesAgo)
-    );
-  };
+  // Remove sessions with no oc4d log activity (SSE "heartbeat") within the window
+  const cleanupInactiveSessions = useCallback(() => {
+    const staleBefore = new Date(Date.now() - SESSION_INACTIVITY_MS);
+    setUserSessions((prev) => {
+      const removed = prev.filter((s) => s.lastActivity <= staleBefore);
+      const kept = prev.filter((s) => s.lastActivity > staleBefore);
+      if (removed.length > 0) {
+        queueMicrotask(() => {
+          for (const s of removed) {
+            void postModulefetchIngest({
+              userId: sessionToModulefetchUserId(s),
+              moduleId: s.module,
+              durationSeconds: s.duration,
+            });
+          }
+        });
+      }
+      return kept;
+    });
+  }, []);
 
-  // Update session durations
+  // Compute the displayed duration for a session.
+  //
+  // Both the polling effect and the 1-second ticker call this so the
+  // value the user sees is consistent. The server-side `duration` field
+  // is anchored to `lastActivityMs - startTimeMs` and only advances
+  // every 30s when a heartbeat arrives — if the polling effect were to
+  // overwrite the row with `s.duration`, the "Time spent" cell would
+  // oscillate between the live tick and the (stale) server value as
+  // polls and ticks raced.
+  //
+  // Freshness gate: if the last evidence of activity is older than
+  // `SESSION_INACTIVITY_MS / 2`, the user is probably gone and we
+  // freeze on `lastActivity - startTime` rather than ticking up
+  // forever.
+  const FRESH_WINDOW_MS = Math.max(SESSION_INACTIVITY_MS / 2, 60_000);
+  const computeDisplayDuration = useCallback(
+    (startTime: Date, lastActivity: Date): number => {
+      const now = Date.now();
+      const lastActivityMs = lastActivity.getTime();
+      const startTimeMs = startTime.getTime();
+      const fresh = now - lastActivityMs <= FRESH_WINDOW_MS;
+      return fresh
+        ? Math.max(0, Math.floor((now - startTimeMs) / 1000))
+        : Math.max(0, Math.floor((lastActivityMs - startTimeMs) / 1000));
+    },
+    [FRESH_WINDOW_MS]
+  );
+
   useEffect(() => {
     const interval = setInterval(() => {
-      setUserSessions((prev) =>
-        prev.map((session) => ({
-          ...session,
-          duration: Math.floor(
-            (Date.now() - session.startTime.getTime()) / 1000
-          ), // seconds instead of minutes
-        }))
-      );
+      setUserSessions((prev) => {
+        let changed = false;
+        const next = prev.map((session) => {
+          const computed = computeDisplayDuration(
+            session.startTime,
+            session.lastActivity
+          );
+          if (computed === session.duration) return session;
+          changed = true;
+          return { ...session, duration: computed };
+        });
+        return changed ? next : prev;
+      });
 
-      // Clean up inactive sessions
-      cleanupInactiveSessions();
-    }, 1000); // Update every second
+      if (!stats.backgroundModuleMonitor) {
+        cleanupInactiveSessions();
+      }
+    }, 1000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [
+    cleanupInactiveSessions,
+    computeDisplayDuration,
+    stats.backgroundModuleMonitor,
+  ]);
 
   // Check timer violations periodically
   useEffect(() => {
     const interval = setInterval(checkTimerViolations, 5000);
     return () => clearInterval(interval);
-  }, [userSessions, moduleTimers]);
+  }, [checkTimerViolations]);
 
-  // Start/Stop monitoring
-  const toggleMonitoring = async () => {
-    if (isMonitoring) {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
+  /**
+   * Optional: write session-log lines on a timer while monitoring (same ingest as
+   * Stop). Server env MODULEFETCH_PERIODIC_FLUSH_MINUTES (exposed via /api/stats).
+   */
+  useEffect(() => {
+    if (!isMonitoring || stats.backgroundModuleMonitor) return;
+    const mins = stats.modulefetchPeriodicFlushMinutes ?? 0;
+    if (!Number.isFinite(mins) || mins <= 0) return;
+    const ms = Math.round(mins * 60 * 1000);
+    const id = window.setInterval(() => {
+      for (const s of userSessionsRef.current) {
+        void postModulefetchIngest({
+          userId: sessionToModulefetchUserId(s),
+          moduleId: s.module,
+          durationSeconds: s.duration,
+          recordedAt: new Date().toISOString(),
+        });
       }
+    }, ms);
+    return () => clearInterval(id);
+  }, [isMonitoring, stats.modulefetchPeriodicFlushMinutes, stats.backgroundModuleMonitor]);
+
+  const closeEventSourceOnly = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  }, []);
+
+  const stopMonitoring = useCallback(() => {
+    if (statsRef.current.backgroundModuleMonitor) {
+      setBackgroundViewPaused(true);
+      setUserSessions([]);
+      closeEventSourceOnly();
+      setLogSourceInfo(null);
       setIsMonitoring(false);
-    } else {
-      try {
-        const eventSource = new EventSource("/api/logs/stream");
-        eventSourceRef.current = eventSource;
+      return;
+    }
+    const snapshot = userSessionsRef.current;
+    for (const s of snapshot) {
+      void postModulefetchIngest({
+        userId: sessionToModulefetchUserId(s),
+        moduleId: s.module,
+        durationSeconds: s.duration,
+      });
+    }
+    setUserSessions([]);
+    closeEventSourceOnly();
+    setLogSourceInfo(null);
+    setIsMonitoring(false);
+  }, [closeEventSourceOnly]);
 
-        eventSource.onmessage = (event) => {
-          const logData = JSON.parse(event.data);
-          const parsed = parseLogEntry(logData.line);
+  const startMonitoring = useCallback(() => {
+    if (statsRef.current.backgroundModuleMonitor) return;
+    if (eventSourceRef.current) return;
+    try {
+      setLogSourceInfo(null);
+      const eventSource = new EventSource("/api/logs/stream");
+      eventSourceRef.current = eventSource;
 
-          if (parsed) {
-            updateUserSession(parsed.ip, parsed.module);
+      eventSource.addEventListener("log-source", (ev: Event) => {
+        try {
+          const me = ev as MessageEvent;
+          const data = JSON.parse(me.data) as {
+            available?: boolean;
+            reason?: string;
+          };
+          if (data.available === false && data.reason) {
+            setLogSourceInfo({ reason: data.reason });
           }
-        };
+        } catch {
+          /* ignore malformed meta */
+        }
+      });
 
-        eventSource.onerror = (error) => {
-          console.error("EventSource failed:", error);
-          setIsMonitoring(false);
-        };
+      eventSource.onmessage = (event) => {
+        const logData = JSON.parse(event.data);
+        const parsed = parseOc4dModuleAccessLine(logData.line);
 
-        setIsMonitoring(true);
-      } catch (error) {
-        console.error("Failed to start monitoring:", error);
-      }
+        if (parsed) {
+          setLogSourceInfo(null);
+          console.log(
+            `📋 Parsed: ${parsed.username} @ ${parsed.ip} → module ${parsed.module}`
+          );
+          updateUserSession(parsed.ip, parsed.username, parsed.module);
+          return;
+        }
+        const heartbeat = parseOc4dModuleAssetHeartbeat(logData.line);
+        if (heartbeat) {
+          setLogSourceInfo(null);
+          touchUserSessionActivity(
+            heartbeat.ip,
+            heartbeat.username,
+            heartbeat.module
+          );
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error("EventSource failed:", error);
+        closeEventSourceOnly();
+        setLogSourceInfo(null);
+        setIsMonitoring(false);
+      };
+
+      setIsMonitoring(true);
+    } catch (error) {
+      console.error("Failed to start monitoring:", error);
+    }
+  }, [touchUserSessionActivity, updateUserSession, closeEventSourceOnly]);
+
+  const toggleMonitoring = () => {
+    if (statsRef.current.backgroundModuleMonitor) {
+      setBackgroundViewPaused((paused) => {
+        if (paused) {
+          setIsMonitoring(true);
+          return false;
+        }
+        setIsMonitoring(false);
+        setUserSessions([]);
+        return true;
+      });
+      return;
+    }
+    if (isMonitoring) {
+      stopMonitoring();
+    } else {
+      startMonitoring();
     }
   };
+
+  useEffect(() => {
+    if (stats.backgroundModuleMonitor) {
+      closeEventSourceOnly();
+      setIsMonitoring(true);
+      setBackgroundViewPaused(false);
+      return () => {
+        closeEventSourceOnly();
+      };
+    }
+    startMonitoring();
+    return () => {
+      if (!statsRef.current.backgroundModuleMonitor) {
+        stopMonitoring();
+      } else {
+        closeEventSourceOnly();
+      }
+    };
+  }, [
+    stats.backgroundModuleMonitor,
+    startMonitoring,
+    stopMonitoring,
+    closeEventSourceOnly,
+  ]);
+
+  useEffect(() => {
+    if (!stats.backgroundModuleMonitor || backgroundViewPaused) return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetch("/api/live-sessions");
+        const data = (await res.json()) as {
+          sessions?: Array<{
+            ip: string;
+            username: string;
+            displayName?: string;
+            module: string;
+            startTime: string;
+            lastActivity: string;
+            duration: number;
+          }>;
+        };
+        if (cancelled) return;
+        const list = data.sessions ?? [];
+        // Compute duration locally (don't trust `s.duration` from the
+        // server) so the polled snapshot matches what the once-a-second
+        // ticker would render. Otherwise the cell oscillates between
+        // the live tick (now - startTime) and the stale server value
+        // (lastActivity - startTime, only advances every 30s) as the
+        // poll and tick race each other.
+        setUserSessions(
+          list.map((s) => {
+            const startTime = new Date(s.startTime);
+            const lastActivity = new Date(s.lastActivity);
+            return {
+              ip: s.ip,
+              username: s.username,
+              displayName: s.displayName,
+              module: s.module,
+              startTime,
+              lastActivity,
+              duration: computeDisplayDuration(startTime, lastActivity),
+            };
+          })
+        );
+      } catch {
+        /* ignore */
+      }
+    };
+    void pull();
+    const id = window.setInterval(() => void pull(), 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [
+    stats.backgroundModuleMonitor,
+    backgroundViewPaused,
+    computeDisplayDuration,
+  ]);
 
   // Format duration for display
   const formatDuration = (seconds: number) => {
@@ -399,7 +715,11 @@ export default function CDNModuleMonitor() {
 
     if (isOver) {
       console.log(
-        `🔴 Session over limit: ${session.ip} on ${session.module} (${session.duration}s > ${limitInSeconds}s)`
+        `🔴 Session over limit: ${
+          session.username === "Guest"
+            ? `Guest (${session.ip})`
+            : `${labelForSessionUser(session)} @ ${session.ip}`
+        } on ${session.module} (${session.duration}s > ${limitInSeconds}s)`
       );
     }
 
@@ -416,17 +736,67 @@ export default function CDNModuleMonitor() {
   const fetchModules = async () => {
     try {
       const response = await fetch("/api/modules");
-      const data = await response.json();
-      setModules(data);
+      let data: unknown = null;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Modules API returned a non-JSON response.");
+      }
+      if (!response.ok) {
+        throw new Error(`Modules API returned ${response.status}.`);
+      }
+
+      let list: Module[] = [];
+      let infoParts: string[] = [];
+
+      if (Array.isArray(data)) {
+        list = data as Module[];
+      } else if (data && typeof data === "object") {
+        const payload = data as ModulesApiPayload;
+        list = Array.isArray(payload.modules) ? payload.modules : [];
+        if (payload.sources) {
+          const merged = payload.sources.mergedCount ?? list.length;
+          const dbCount = payload.sources.database?.count ?? 0;
+          const scanCount = payload.sources.scan?.count ?? 0;
+          infoParts.push(
+            `Loaded ${merged} modules (DB: ${dbCount}, scan: ${scanCount}).`
+          );
+        }
+        if (Array.isArray(payload.warnings) && payload.warnings.length > 0) {
+          infoParts = [...infoParts, ...payload.warnings];
+        }
+      } else {
+        throw new Error("Modules API returned an unexpected payload.");
+      }
+
+      setModules(list);
+      setModulesLoadError(null);
+      setModulesLoadInfo(infoParts.length > 0 ? infoParts.join(" ") : null);
       console.log(
         "📚 Loaded modules for matching:",
-        data.map((m: Module) => ({
+        list.map((m) => ({
           name: m.name,
-          urlId: extractModuleIdFromUrl(m.indexHtmlUrl),
+          urlId: extractModuleIdFromPath(m.indexHtmlUrl),
         }))
       );
     } catch (error) {
       console.error("Failed to fetch modules:", error);
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to load modules from server.";
+      setModulesLoadError(message);
+      setModulesLoadInfo(null);
+    }
+  };
+
+  const fetchUserPool = async () => {
+    try {
+      const response = await fetch("/api/user-pool");
+      const data = (await response.json()) as { map?: Record<string, string> };
+      setUserPoolMap(data.map ?? {});
+    } catch (error) {
+      console.error("Failed to fetch user pool:", error);
     }
   };
 
@@ -442,18 +812,24 @@ export default function CDNModuleMonitor() {
       }
     };
 
-    fetchStats();
-    fetchModules();
-    const interval = setInterval(fetchStats, 30000);
+    const tick = async () => {
+      await fetchStats();
+      await fetchModules();
+      await fetchUserPool();
+    };
+    void tick();
+    const interval = setInterval(() => void tick(), 30000);
     return () => clearInterval(interval);
   }, []);
 
   // Update stats based on current sessions
   useEffect(() => {
-    const uniqueIPs = new Set(userSessions.map((session) => session.ip));
+    const uniqueKeys = new Set(
+      userSessions.map((s) => `${s.ip}\t${s.username}`)
+    );
     setStats((prev) => ({
       ...prev,
-      uniqueUsersToday: uniqueIPs.size,
+      uniqueUsersToday: uniqueKeys.size,
       activeSessions: userSessions.length,
     }));
   }, [userSessions]);
@@ -475,36 +851,48 @@ export default function CDNModuleMonitor() {
     };
   }, []);
 
-  // Filter modules based on search term
-  const filteredModules = modules.filter(
-    (module) =>
-      module.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      module.description.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  // Filter modules based on search term (include path/slug so e.g. "en-ebooks" matches)
+  const q = searchTerm.toLowerCase().trim();
+  const filteredModules = modules.filter((module) => {
+    const slug = (extractModuleIdFromPath(module.indexHtmlUrl) ?? "").toLowerCase();
+    const url = module.indexHtmlUrl.toLowerCase();
+    return (
+      module.name.toLowerCase().includes(q) ||
+      module.description.toLowerCase().includes(q) ||
+      url.includes(q) ||
+      slug.includes(q)
+    );
+  });
 
   // Check if module has a timer set
-  const hasTimer = (moduleName: string) => {
+  const hasTimer = (module: Module) => {
+    const slug = normalizeModuleKey(getModuleSlug(module));
     return moduleTimers.some(
       (timer) =>
-        timer.moduleName === moduleName && timer.moduleName !== "default"
+        normalizeModuleKey(timer.moduleSlug) === slug &&
+        timer.moduleSlug !== "default"
     );
   };
 
   // Get existing timer for module
-  const getExistingTimer = (moduleName: string) => {
+  const getExistingTimer = (module: Module) => {
+    const slug = normalizeModuleKey(getModuleSlug(module));
     return moduleTimers.find(
       (timer) =>
-        timer.moduleName === moduleName && timer.moduleName !== "default"
+        normalizeModuleKey(timer.moduleSlug) === slug &&
+        timer.moduleSlug !== "default"
     );
   };
 
-  const handleModuleSelect = (moduleName: string) => {
-    setSelectedModule(moduleName);
-    setSearchTerm(moduleName);
+  const handleModuleSelect = (module: Module) => {
+    const slug = getModuleSlug(module);
+    setSelectedModule(module.name);
+    setSelectedModuleSlug(slug);
+    setSearchTerm(module.name);
     setIsDropdownOpen(false);
 
     // If module already has a timer, populate the time field
-    const existingTimer = getExistingTimer(moduleName);
+    const existingTimer = getExistingTimer(module);
     if (existingTimer) {
       setTimerMinutes(existingTimer.timeLimit.toString());
     } else {
@@ -530,7 +918,24 @@ export default function CDNModuleMonitor() {
 
   // Get timer limit for a specific module
   const getModuleTimeLimit = (moduleName: string) => {
-    const timer = findTimerForSession({ module: moduleName } as UserSession);
+    const normalizedInput = normalizeModuleKey(moduleName);
+    const direct = moduleTimers.find(
+      (timer) =>
+        timer.isActive &&
+        (normalizeModuleKey(timer.moduleSlug) === normalizedInput ||
+          normalizeModuleKey(timer.moduleName) === normalizedInput)
+    );
+    if (direct) return direct.timeLimit;
+
+    const dummySession: UserSession = {
+      ip: "",
+      username: "",
+      module: moduleName,
+      startTime: new Date(0),
+      duration: 0,
+      lastActivity: new Date(0),
+    };
+    const timer = findTimerForSession(dummySession);
     return timer ? timer.timeLimit : null;
   };
 
@@ -603,7 +1008,7 @@ export default function CDNModuleMonitor() {
                 {stats.uniqueUsersToday}
               </div>
               <p className="text-sm text-gray-500">
-                Unique IPs currently active
+                Distinct user sessions (IP + log identity; name from User when email matches)
               </p>
             </CardContent>
           </Card>
@@ -668,13 +1073,15 @@ export default function CDNModuleMonitor() {
 
                     {isDropdownOpen && (
                       <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-md shadow-lg max-h-60 overflow-auto">
-                        {filteredModules.length > 0 ? (
+                        {modulesLoadError ? (
+                          <div className="px-3 py-2 text-sm text-red-600">
+                            {modulesLoadError}
+                          </div>
+                        ) : filteredModules.length > 0 ? (
                           filteredModules.map((module) => {
-                            const hasExistingTimer = hasTimer(module.name);
-                            const existingTimer = getExistingTimer(module.name);
-                            const moduleUrlId = extractModuleIdFromUrl(
-                              module.indexHtmlUrl
-                            );
+                            const hasExistingTimer = hasTimer(module);
+                            const existingTimer = getExistingTimer(module);
+                            const moduleUrlId = getModuleSlug(module);
 
                             return (
                               <div
@@ -684,7 +1091,7 @@ export default function CDNModuleMonitor() {
                                     ? "border-l-orange-400 bg-orange-50"
                                     : "border-l-transparent"
                                 }`}
-                                onClick={() => handleModuleSelect(module.name)}
+                                onClick={() => handleModuleSelect(module)}
                               >
                                 <div className="flex items-center justify-between">
                                   <div className="flex-1">
@@ -720,7 +1127,7 @@ export default function CDNModuleMonitor() {
                                         {existingTimer?.timeLimit}m
                                       </Badge>
                                     )}
-                                    {selectedModule === module.name && (
+                                    {selectedModuleSlug === moduleUrlId && (
                                       <Check className="h-4 w-4 text-orange-600" />
                                     )}
                                   </div>
@@ -730,12 +1137,19 @@ export default function CDNModuleMonitor() {
                           })
                         ) : (
                           <div className="px-3 py-2 text-sm text-gray-500">
-                            No modules found
+                            {modules.length === 0
+                              ? "No modules are available from the server yet."
+                              : "No modules match your search."}
                           </div>
                         )}
                       </div>
                     )}
                   </div>
+                  {modulesLoadError ? (
+                    <p className="text-xs text-red-600">{modulesLoadError}</p>
+                  ) : modulesLoadInfo ? (
+                    <p className="text-xs text-gray-500">{modulesLoadInfo}</p>
+                  ) : null}
 
                   <div className="flex gap-2">
                     <Input
@@ -749,9 +1163,17 @@ export default function CDNModuleMonitor() {
                       size="sm"
                       onClick={addModuleTimer}
                       className="bg-orange-600 hover:bg-orange-700 text-white"
-                      disabled={!selectedModule || !timerMinutes}
+                      disabled={!selectedModuleSlug || !timerMinutes}
                     >
-                      {hasTimer(selectedModule) ? "Update" : "Set Limit"}
+                      {selectedModuleSlug &&
+                      moduleTimers.some(
+                        (t) =>
+                          normalizeModuleKey(t.moduleSlug) ===
+                            normalizeModuleKey(selectedModuleSlug) &&
+                          t.moduleSlug !== "default"
+                      )
+                        ? "Update"
+                        : "Set Limit"}
                     </Button>
                   </div>
                 </div>
@@ -761,7 +1183,29 @@ export default function CDNModuleMonitor() {
         </div>
 
         {/* Monitoring Control */}
-        <div className="flex justify-center">
+        <div className="flex flex-col items-center gap-4">
+          {isMonitoring && logSourceInfo && (
+            <Alert className="max-w-2xl border-amber-200 bg-amber-50 text-left">
+              <AlertTriangle className="h-4 w-4 text-amber-700" />
+              <AlertDescription className="text-amber-900 text-sm">
+                <strong>Live log source unavailable.</strong>{" "}
+                {logSourceInfo.reason} Rows here only appear when the server can
+                stream real oc4d lines containing{" "}
+                <code className="text-xs bg-white/80 px-1 rounded">/modules/</code>.
+              </AlertDescription>
+            </Alert>
+          )}
+          {stats.backgroundModuleMonitor && (
+            <Alert className="max-w-2xl border-blue-200 bg-blue-50 text-left">
+              <Database className="h-4 w-4 text-blue-700" />
+              <AlertDescription className="text-blue-900 text-sm">
+                <strong>Server-side monitor is on</strong> (
+                <code className="text-xs">MODULEGAZE_BACKGROUND_MONITOR</code>
+                ). Sessions and archives update without keeping this tab on the log
+                stream; this page refreshes data from the server every few seconds.
+              </AlertDescription>
+            </Alert>
+          )}
           <Button
             onClick={toggleMonitoring}
             size="lg"
@@ -771,7 +1215,19 @@ export default function CDNModuleMonitor() {
                 : "bg-orange-600 hover:bg-orange-700"
             } text-white px-8 py-3 text-lg`}
           >
-            {isMonitoring ? (
+            {stats.backgroundModuleMonitor ? (
+              isMonitoring ? (
+                <>
+                  <Pause className="h-5 w-5 mr-2" />
+                  Pause live view
+                </>
+              ) : (
+                <>
+                  <Play className="h-5 w-5 mr-2" />
+                  Resume live view
+                </>
+              )
+            ) : isMonitoring ? (
               <>
                 <Pause className="h-5 w-5 mr-2" />
                 Stop Monitoring
@@ -854,7 +1310,7 @@ export default function CDNModuleMonitor() {
         <Card className="border-gray-200 shadow-sm">
           <CardHeader className="pb-4">
             <CardTitle className="text-2xl font-bold text-gray-900">
-              IP Module Time Tracking
+              User &amp; module time tracking
             </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
@@ -863,22 +1319,41 @@ export default function CDNModuleMonitor() {
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
                     <th className="text-left p-4 font-semibold text-gray-700">
-                      IP Address
+                      Name
                     </th>
                     <th className="text-left p-4 font-semibold text-gray-700">
-                      Current Module
+                      IP address
+                    </th>
+                    <th className="text-left p-4 font-semibold text-gray-700">
+                      Current module
                     </th>
                     <th className="text-right p-4 font-semibold text-gray-700">
-                      Time Spent
+                      Time spent
                     </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {userSessions.map((session, index) => (
+                  {userSessions.map((session) => (
                     <tr
-                      key={index}
+                      key={`${session.ip}\t${session.username}`}
                       className="hover:bg-gray-50 transition-colors"
                     >
+                      <td className="p-4">
+                        {session.username === "Guest" ? (
+                          <div className="flex flex-col gap-0.5">
+                            <span className="text-gray-600 italic font-medium">
+                              Guest
+                            </span>
+                            <span className="font-mono text-sm text-gray-800">
+                              {session.ip}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="font-medium text-gray-900">
+                            {labelForSessionUser(session)}
+                          </span>
+                        )}
+                      </td>
                       <td className="p-4">
                         <span className="font-mono text-blue-600 font-medium">
                           {session.ip}
@@ -929,8 +1404,10 @@ export default function CDNModuleMonitor() {
                 <div className="text-center py-12 text-gray-500">
                   <Database className="h-12 w-12 mx-auto mb-4 text-gray-300" />
                   <p className="text-lg">No active sessions</p>
-                  <p className="text-sm">
-                    Start monitoring to see live user activity
+                  <p className="text-sm text-gray-500">
+                    {isMonitoring
+                      ? "Waiting for oc4d log lines that match module URLs."
+                      : "The log stream is not connected — use Start monitoring above."}
                   </p>
                 </div>
               )}
