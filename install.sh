@@ -30,8 +30,8 @@ sudo systemctl daemon-reload
 # Enable the service to start on boot
 sudo systemctl enable cdnmodulegaze.service
 
-# Start the service immediately
-sudo systemctl start cdnmodulegaze.service
+# Restart so redeploys pick up new builds and env vars
+sudo systemctl restart cdnmodulegaze.service
 
 # Display a success message
 tput setaf 2
