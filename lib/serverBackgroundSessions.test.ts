@@ -47,29 +47,22 @@ test("entry log creates a session for the user", () => {
   assert.equal(snap[0]?.module, "cdn_math");
 });
 
-test("live snapshot duration freezes at lastActivityMs (does not tick up while idle)", async () => {
-  // Regression: `duration` used to be `now - startTimeMs`, so an idle
-  // user kept appearing to advance their time-on-module right up to the
-  // 5-min idle-timeout, even after they had closed the tab. New
-  // semantics: `duration = lastActivityMs - startTimeMs`, so once the
-  // user goes idle the live counter freezes at last evidence of
-  // presence. (Phase-2 heartbeats keep this fresh while the tab is open.)
+test("live snapshot duration ticks from startTime while the session is live", async () => {
+  // Static modules freeze lastActivity after the initial asset burst.
+  // The live snapshot must still report elapsed time so the dashboard
+  // does not stick at 0s for the whole visit.
   clearBackgroundSessions();
   processBackgroundJournalLine(
     entryLine("192.168.1.20", "anna@example.com", "cdn_math")
   );
   const initial = getLiveSessionsSnapshot()[0]!;
-  // Wait long enough that `now - startTimeMs` would clearly differ from
-  // `lastActivityMs - startTimeMs` if the bug were still present.
   await new Promise((r) => setTimeout(r, 1100));
-  const idle = getLiveSessionsSnapshot()[0]!;
-  assert.equal(
-    idle.duration,
-    initial.duration,
-    "duration must not advance while the session is idle"
+  const later = getLiveSessionsSnapshot()[0]!;
+  assert.ok(
+    later.duration >= initial.duration + 1,
+    "duration must advance while the session remains in the live list"
   );
-  assert.equal(idle.duration, 0);
-  assert.equal(idle.lastActivity, initial.lastActivity);
+  assert.equal(later.lastActivity, initial.lastActivity);
 });
 
 test("matching-module asset heartbeat bumps lastActivity, does not duplicate the session", () => {
@@ -228,6 +221,24 @@ test("recordModuleHeartbeat (browser ping) bumps lastActivity for the matching s
     new Date(after.lastActivity).getTime() >
       new Date(before.lastActivity).getTime(),
     "heartbeat must advance lastActivity"
+  );
+});
+
+test("Guest browser heartbeat bumps the logged-in session at the same IP+module", async () => {
+  clearBackgroundSessions();
+  processBackgroundJournalLine(
+    entryLine("192.168.1.20", "anna@example.com", "cdn_math")
+  );
+  const before = getLiveSessionsSnapshot()[0]!;
+  await new Promise((r) => setTimeout(r, 20));
+  recordModuleHeartbeat("192.168.1.20", "Guest", "cdn_math");
+  const after = getLiveSessionsSnapshot();
+  assert.equal(after.length, 1);
+  assert.equal(after[0]?.username, "anna@example.com");
+  assert.ok(
+    new Date(after[0]!.lastActivity).getTime() >
+      new Date(before.lastActivity).getTime(),
+    "Guest ping must advance the logged-in row's lastActivity"
   );
 });
 

@@ -146,6 +146,22 @@ function touchSession(
     return;
   }
 
+  // Injected heartbeat sometimes lands as Guest/anonymous when the module
+  // HTML request lacked identity cookies, while the journal already has a
+  // logged-in row for this IP+module. Attribute presence to that row so
+  // Time spent keeps advancing instead of dropping the ping.
+  if (username === "Guest") {
+    const loggedInIdx = state.rows.findIndex(
+      (r) =>
+        r.ip === ip && r.module === moduleSlug && r.username !== "Guest"
+    );
+    if (loggedInIdx >= 0) {
+      const r = state.rows[loggedInIdx];
+      if (r) state.rows[loggedInIdx] = { ...r, lastActivityMs: now };
+      return;
+    }
+  }
+
   // No session for this exact `(ip, user, module)`. Three scenarios:
   //
   //   a) Cold start: monitor is just coming up and the user was already
@@ -273,6 +289,7 @@ export type LiveSessionSnapshot = {
 };
 
 export function getLiveSessionsSnapshot(): LiveSessionSnapshot[] {
+  const now = Date.now();
   return state.rows.map((r) => ({
     ip: r.ip,
     username: r.username,
@@ -280,16 +297,11 @@ export function getLiveSessionsSnapshot(): LiveSessionSnapshot[] {
     module: r.module,
     startTime: new Date(r.startTimeMs).toISOString(),
     lastActivity: new Date(r.lastActivityMs).toISOString(),
-    // Tracking time is bounded by the last signal we have for this user.
-    // Using `now - startTimeMs` would keep ticking up after the user
-    // closed their tab (we have no way to know they're gone until idle
-    // timeout fires). Anchoring duration to `lastActivityMs` instead
-    // freezes the counter at the last evidence of presence — accurate
-    // for games/video/interactive modules that emit ongoing requests,
-    // and conservative for static pages until Phase-2 heartbeats land.
-    duration: Math.max(
-      0,
-      Math.floor((r.lastActivityMs - r.startTimeMs) / 1000)
-    ),
+    // While a row is still in the live list it is "present". Tick from
+    // session start so the dashboard does not sit on 0s for static HTML
+    // modules whose lastActivity freezes after the initial asset burst.
+    // Idle cleanup removes the row once heartbeats/journal activity stop
+    // for SESSION_INACTIVITY_MS — that is what bounds overcount.
+    duration: Math.max(0, Math.floor((now - r.startTimeMs) / 1000)),
   }));
 }

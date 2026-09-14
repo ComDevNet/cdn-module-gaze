@@ -419,40 +419,21 @@ export default function CDNModuleMonitor() {
   // Compute the displayed duration for a session.
   //
   // Both the polling effect and the 1-second ticker call this so the
-  // value the user sees is consistent. The server-side `duration` field
-  // is anchored to `lastActivityMs - startTimeMs` and only advances
-  // every 30s when a heartbeat arrives — if the polling effect were to
-  // overwrite the row with `s.duration`, the "Time spent" cell would
-  // oscillate between the live tick and the (stale) server value as
-  // polls and ticks raced.
-  //
-  // Freshness gate: if the last evidence of activity is older than
-  // `SESSION_INACTIVITY_MS / 2`, the user is probably gone and we
-  // freeze on `lastActivity - startTime` rather than ticking up
-  // forever.
-  const FRESH_WINDOW_MS = Math.max(SESSION_INACTIVITY_MS / 2, 60_000);
-  const computeDisplayDuration = useCallback(
-    (startTime: Date, lastActivity: Date): number => {
-      const now = Date.now();
-      const lastActivityMs = lastActivity.getTime();
-      const startTimeMs = startTime.getTime();
-      const fresh = now - lastActivityMs <= FRESH_WINDOW_MS;
-      return fresh
-        ? Math.max(0, Math.floor((now - startTimeMs) / 1000))
-        : Math.max(0, Math.floor((lastActivityMs - startTimeMs) / 1000));
-    },
-    [FRESH_WINDOW_MS]
-  );
+  // value the user sees is consistent. Prefer `now - startTime` while
+  // the row is still in the live list — static modules often freeze
+  // `lastActivity` after the first asset burst, and a freshness gate
+  // based on that would show 0s after ~2.5 minutes even though the
+  // server still lists the session as active.
+  const computeDisplayDuration = useCallback((startTime: Date): number => {
+    return Math.max(0, Math.floor((Date.now() - startTime.getTime()) / 1000));
+  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
       setUserSessions((prev) => {
         let changed = false;
         const next = prev.map((session) => {
-          const computed = computeDisplayDuration(
-            session.startTime,
-            session.lastActivity
-          );
+          const computed = computeDisplayDuration(session.startTime);
           if (computed === session.duration) return session;
           changed = true;
           return { ...session, duration: computed };
@@ -652,12 +633,8 @@ export default function CDNModuleMonitor() {
         };
         if (cancelled) return;
         const list = data.sessions ?? [];
-        // Compute duration locally (don't trust `s.duration` from the
-        // server) so the polled snapshot matches what the once-a-second
-        // ticker would render. Otherwise the cell oscillates between
-        // the live tick (now - startTime) and the stale server value
-        // (lastActivity - startTime, only advances every 30s) as the
-        // poll and tick race each other.
+        // Compute duration locally from startTime so the polled snapshot
+        // matches the once-a-second ticker (both use now - startTime).
         setUserSessions(
           list.map((s) => {
             const startTime = new Date(s.startTime);
@@ -669,7 +646,7 @@ export default function CDNModuleMonitor() {
               module: s.module,
               startTime,
               lastActivity,
-              duration: computeDisplayDuration(startTime, lastActivity),
+              duration: computeDisplayDuration(startTime),
             };
           })
         );
