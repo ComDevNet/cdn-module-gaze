@@ -31,11 +31,13 @@ Heartbeats are accepted and discarded (no error) when:
 - Client IP cannot be determined
 - IP is loopback and `MODULEGAZE_INCLUDE_LOOPBACK` is not enabled
 
-## Recommended client behavior
+## Deployed oc4d client behavior
 
-- `ping` on visibility / interval (~30s while tab visible) so `lastActivityMs` advances
-- `close` on `pagehide` / `beforeunload` when possible
-- Always send the stable module **slug**, not a build id or asset folder name
+- Send one `ping` immediately, then every 30 seconds while the tab is visible, using the stable module **slug**.
+- Do not send `close` on `pagehide` or `beforeunload`. These events also fire during navigation within a module; closing the session then would reset its duration on the next page.
+- After the last journal or heartbeat activity, the session remains in the live list until the five-minute inactivity timeout. Cleanup saves duration through `lastActivityMs`, excluding the idle wait.
+
+The endpoint still supports `close` for callers that explicitly end a matching session, but the deployed oc4d script does not send it. A hidden tab also stops periodic pings and can time out if no other activity arrives.
 
 ## Relation to journal lines
 

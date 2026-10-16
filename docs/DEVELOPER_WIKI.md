@@ -189,7 +189,9 @@ Query only (no body):
 curl -X POST "http://127.0.0.1:3002/api/module-heartbeat?slug=cdn_math&event=ping&user=teacher@example.com"
 ```
 
-This repo only exposes the endpoint. A small script on **oc4d-served** module pages is expected to call it (`ping` / `close`); that injection lives in oc4d-server, not here.
+This repo exposes the endpoint; script injection lives in oc4d-server. The deployed script sends one `ping` immediately, then every 30 seconds while the tab is visible. It deliberately sends no `close` beacon on `pagehide` / `beforeunload`, because those events also fire during navigation within a module and would reset session duration. The endpoint still supports explicit `close` requests from other callers.
+
+When journal and heartbeat activity stop, the session remains in the live list until the five-minute inactivity timeout. Cleanup saves duration through `lastActivityMs`, excluding the idle wait. Hidden tabs stop periodic pings too, so they can time out without being closed. See [Heartbeat Integration](Heartbeat-Integration.md#deployed-oc4d-client-behavior).
 
 ### `GET /api/logs/stream`
 
